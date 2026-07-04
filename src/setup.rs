@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use tokio::process::Command;
@@ -667,56 +667,33 @@ fn prompt(question: &str, default: Option<&str>) -> Result<String> {
     }
 }
 
-/// Prompt the user to pick one of several named options. Returns the chosen
-/// option's key. Matching is case-insensitive and accepts the option number.
+/// Prompt the user to pick one of several named options via an arrow-key menu.
+/// Returns the chosen option's key. The first option is the default selection.
 fn prompt_choice<'a>(question: &str, options: &[(&'a str, &str)]) -> Result<&'a str> {
-    println!("{question}");
-    for (i, (key, desc)) in options.iter().enumerate() {
-        println!("  {}) {key} - {desc}", i + 1);
-    }
-    let default_key = options[0].0;
-    loop {
-        print!("Choice [{default_key}]: ");
-        io::stdout().flush()?;
-        let answer = match read_line()? {
-            None => anyhow::bail!("aborted (end of input)"),
-            Some(s) => s,
-        };
-        if answer.is_empty() {
-            return Ok(default_key);
-        }
-        // Accept a 1-based index.
-        if let Ok(n) = answer.parse::<usize>() {
-            if n >= 1 && n <= options.len() {
-                return Ok(options[n - 1].0);
-            }
-        }
-        // Or the option key (case-insensitive).
-        let lower = answer.to_ascii_lowercase();
-        if let Some((key, _)) = options.iter().find(|(k, _)| k.eq_ignore_ascii_case(&lower)) {
-            return Ok(key);
-        }
-        println!("Please choose one of the listed options.");
-    }
+    let display: Vec<String> = options
+        .iter()
+        .map(|(key, desc)| format!("{key} — {desc}"))
+        .collect();
+    let chosen = inquire::Select::new(question, display)
+        .raw_prompt()
+        .map_err(map_inquire_err)?;
+    Ok(options[chosen.index].0)
 }
 
-/// Prompt for a yes/no answer with a default.
+/// Prompt for a yes/no answer with a default, using an interactive confirm.
 fn prompt_yes_no(question: &str, default_yes: bool) -> Result<bool> {
-    let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
-    loop {
-        print!("{question} {hint} ");
-        io::stdout().flush()?;
-        match read_line()? {
-            None => anyhow::bail!("aborted (end of input)"),
-            Some(s) if s.is_empty() => return Ok(default_yes),
-            Some(s) => match s.to_ascii_lowercase().as_str() {
-                "y" | "yes" => return Ok(true),
-                "n" | "no" => return Ok(false),
-                _ => {
-                    println!("Please answer 'y' or 'n'.");
-                    continue;
-                }
-            },
-        }
+    inquire::Confirm::new(question)
+        .with_default(default_yes)
+        .prompt()
+        .map_err(map_inquire_err)
+}
+
+/// Map an `inquire` error into an `anyhow` error, treating Ctrl-C / Esc
+/// cancellation as a clean "aborted" rather than a noisy failure.
+fn map_inquire_err(err: inquire::InquireError) -> anyhow::Error {
+    use inquire::InquireError::{OperationCanceled, OperationInterrupted};
+    match err {
+        OperationCanceled | OperationInterrupted => anyhow!("aborted by user"),
+        other => anyhow!(other),
     }
 }
