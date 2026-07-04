@@ -11,26 +11,22 @@ agent).
 
 ## Security model
 
-This is a **real SSH agent**, not an `ssh-add`-from-a-tempfile hack:
-
-- Private keys are fetched from the vault, parsed, and held **only in this
-  process's memory**. They are **never written to disk** in plaintext.
-- Signing happens **in-process** (RustCrypto). The daemon speaks the SSH agent
-  protocol on a Unix socket exactly like `ssh-agent`, so **agent-forwarding
-  works transparently**.
-- The socket lives at `$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock` and is created
-  `0600` (owner-only). A stale socket from a previous run is removed on startup.
+- Private keys are fetched from the vault, parsed, and held only in this
+  process's memory — never written to disk in plaintext.
+- Signing happens in-process (RustCrypto). The daemon speaks the SSH agent
+  protocol on a Unix socket, so agent-forwarding works transparently.
+- The socket lives at `$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock`, created
+  `0600`. A stale socket from a previous run is removed on startup.
 - Secrets in flight (master password, `BW_SESSION`, API secret) are wrapped in
-  `secrecy`/`zeroize` and passed to the `bw` subprocess through **its own**
-  environment — never process-wide env, never on the command line (where they'd
-  show up in `ps`), never logged.
-- Your **master password is never stored in any config file.** It is provided
-  either as a systemd credential or typed on demand (see below). The config file
-  holds only the Bitwarden *API key* (device auth), and the daemon refuses to
-  read it if its permissions are looser than `0600`.
-
-RSA signatures honour the client's requested algorithm
-(`rsa-sha2-256` / `rsa-sha2-512`); the deprecated SHA-1 `ssh-rsa` is never used.
+  `secrecy`/`zeroize` and passed to the `bw` subprocess through its own
+  environment — never process-wide env, never on the command line, never
+  logged.
+- The master password is never stored in any config file — it's provided
+  either as a systemd credential or typed on demand (see below). The config
+  file holds only the Bitwarden API key (device auth), and the daemon refuses
+  to read it if its permissions are looser than `0600`.
+- RSA signatures use the client's requested algorithm (`rsa-sha2-256` /
+  `rsa-sha2-512`); the deprecated SHA-1 `ssh-rsa` is never used.
 
 ## How it works
 
