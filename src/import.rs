@@ -368,7 +368,68 @@ async fn run_wizard(
         plans.push(decide_for_key(candidate, existing)?);
     }
 
-    execute_plans(plans, cli, session, dry_run).await
+    let changes = execute_plans(plans, cli, session, dry_run).await?;
+
+    // If we actually changed the vault and the daemon is running, offer to nudge
+    // it so the new keys are served immediately without a restart.
+    if !dry_run && changes > 0 {
+        if let Err(e) = offer_daemon_refresh().await {
+            // Best-effort: a failed refresh must not fail the import itself.
+            println!("Could not refresh the running daemon: {e:#}");
+            println!("The new keys will be picked up next time it (re)starts.");
+        }
+    }
+    Ok(())
+}
+
+/// systemd user unit name for the running daemon (matches `setup`).
+const SERVICE_UNIT: &str = "bitwarden-ssh-agent.service";
+
+/// If the daemon service is active, offer to send it SIGHUP so it re-syncs the
+/// vault and picks up the newly-imported keys (the same refresh path the daemon
+/// installs in `main.rs`). No-op if the service isn't running.
+async fn offer_daemon_refresh() -> Result<()> {
+    use tokio::process::Command;
+
+    let is_active = Command::new("systemctl")
+        .args(["--user", "is-active", SERVICE_UNIT])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+        .unwrap_or(false);
+    if !is_active {
+        // Daemon not running under systemd --user; nothing to signal.
+        return Ok(());
+    }
+
+    println!();
+    if !prompt_yes_no(
+        "The agent daemon is running. Send it a refresh signal (SIGHUP) now so \
+         the new keys are served immediately?",
+        true,
+    )? {
+        println!(
+            "Skipped. Refresh later with `systemctl --user kill -s HUP {SERVICE_UNIT}` \
+             (or just re-run your SSH command; a restart also picks them up)."
+        );
+        return Ok(());
+    }
+
+    let out = Command::new("systemctl")
+        .args(["--user", "kill", "-s", "HUP", SERVICE_UNIT])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("running `systemctl --user kill -s HUP`")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`systemctl --user kill` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    println!("Sent SIGHUP; the daemon is re-syncing and reloading its keys.");
+    Ok(())
 }
 
 /// Interactively decide what to do with one selected candidate.
@@ -493,7 +554,7 @@ async fn execute_plans(
     cli: &BitwardenCli,
     session: &Session,
     dry_run: bool,
-) -> Result<()> {
+) -> Result<usize> {
     // Fetch the new-item template once, only if we will actually create anything.
     let will_create = !dry_run
         && plans
@@ -576,7 +637,7 @@ async fn execute_plans(
         }
     }
 
-    Ok(())
+    Ok(created.len() + overwritten.len())
 }
 
 /// Overwrite an existing vault item's key material, preserving its other fields.
