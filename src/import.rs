@@ -301,7 +301,15 @@ pub async fn run(
         println!("No SSH private keys found in {}.", dir.display());
         return Ok(());
     }
-    println!("Found {} candidate key(s).\n", candidates.len());
+    println!("Found {} candidate key(s):\n", candidates.len());
+    // Show the discovered keys in full *before* asking for the master password,
+    // so the user can sanity-check the scan (wrong --ssh-dir, unexpected file)
+    // before authenticating to anything. Vault-dedup status isn't known yet, so
+    // pass `None` — the wizard re-lists them later annotated with vault status.
+    for candidate in candidates.iter() {
+        println!("  {}", candidate_label(candidate, None));
+    }
+    println!();
 
     // Unlock our own `bw` session (independent of the running daemon) and read
     // the SSH Key items already in the vault, so duplicates can be flagged.
