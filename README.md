@@ -174,8 +174,10 @@ ssh you@server
 ```
 bitwarden-ssh-agent setup  [--config <PATH>]
 bitwarden-ssh-agent serve  [--socket <PATH>] [--config <PATH>]
-bitwarden-ssh-agent unlock [--control-socket <PATH>]
-bitwarden-ssh-agent import [--ssh-dir <PATH>] [--config <PATH>] [--dry-run]
+bitwarden-ssh-agent unlock  [--control-socket <PATH>]
+bitwarden-ssh-agent refresh [--control-socket <PATH>]
+bitwarden-ssh-agent list    [--control-socket <PATH>]
+bitwarden-ssh-agent import  [--ssh-dir <PATH>] [--config <PATH>] [--dry-run] [--control-socket <PATH>]
 ```
 
 A subcommand is required; bare invocation prints help. `--help` for details.
