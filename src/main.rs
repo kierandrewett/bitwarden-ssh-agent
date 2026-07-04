@@ -117,11 +117,41 @@ async fn serve(args: ServeArgs) -> Result<()> {
         socket_path.display()
     );
 
+    // Refresh keys on SIGHUP so newly-added vault items can be picked up without
+    // restarting the daemon (re-`bw sync` + reload, reusing the unlocked session).
+    #[cfg(unix)]
+    spawn_sighup_refresh(unlock.clone());
+
     let agent = VaultAgent::new(unlock);
     listen(listener, agent)
         .await
         .context("SSH agent listener terminated")?;
     Ok(())
+}
+
+/// Spawn a task that re-fetches vault keys each time the daemon receives SIGHUP.
+///
+/// `kill -HUP <pid>` (or `systemctl --user reload` with `ExecReload=`) then
+/// picks up keys added to the vault after the daemon started, without a restart.
+#[cfg(unix)]
+fn spawn_sighup_refresh(unlock: UnlockManager) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    tokio::spawn(async move {
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("failed to install SIGHUP handler: {e:#}");
+                return;
+            }
+        };
+        while sighup.recv().await.is_some() {
+            log::info!("received SIGHUP; refreshing vault keys");
+            if let Err(e) = unlock.refresh().await {
+                log::error!("SIGHUP key refresh failed: {e:#}");
+            }
+        }
+    });
 }
 
 /// Determine the socket path: explicit flag, else `$XDG_RUNTIME_DIR/<name>`.

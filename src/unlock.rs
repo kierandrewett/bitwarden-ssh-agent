@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use zeroize::Zeroize;
 
 use crate::agent::VaultKey;
-use crate::bitwarden::BitwardenCli;
+use crate::bitwarden::{BitwardenCli, Session};
 use crate::config::ApiKey;
 
 /// Filename of the systemd credential holding the master password.
@@ -25,7 +25,12 @@ const MASTER_PW_CREDENTIAL: &str = "bw_master_password";
 
 enum State {
     Locked,
-    Unlocked(Arc<Vec<VaultKey>>),
+    Unlocked {
+        /// The live `bw` session key, kept so we can re-sync and reload keys
+        /// (e.g. on SIGHUP) without re-prompting for the master password.
+        session: Arc<Session>,
+        keys: Arc<Vec<VaultKey>>,
+    },
 }
 
 struct Inner {
@@ -58,15 +63,41 @@ impl UnlockManager {
     /// resulting `Unlocked` state and return immediately.
     pub async fn keys(&self) -> Result<Arc<Vec<VaultKey>>> {
         let mut state = self.inner.state.lock().await;
-        if let State::Unlocked(keys) = &*state {
+        if let State::Unlocked { keys, .. } = &*state {
             return Ok(Arc::clone(keys));
         }
 
         log::info!("vault locked; prompting for master password via systemd-ask-password");
         let password = ask_password().await?;
-        let keys = self.unlock_and_load(&password).await?;
-        *state = State::Unlocked(Arc::clone(&keys));
+        let (session, keys) = self.unlock_and_load(&password).await?;
+        *state = State::Unlocked {
+            session,
+            keys: Arc::clone(&keys),
+        };
         Ok(keys)
+    }
+
+    /// Re-sync the vault and reload SSH keys using the existing session.
+    ///
+    /// Triggered by SIGHUP so newly-added vault items can be picked up without
+    /// restarting the daemon. Reuses the already-unlocked session, so the master
+    /// password is never re-prompted. If the vault is still locked (never
+    /// unlocked yet), there is nothing to refresh — the next client request will
+    /// prompt as usual.
+    pub async fn refresh(&self) -> Result<()> {
+        let mut state = self.inner.state.lock().await;
+        let session = match &*state {
+            State::Locked => {
+                log::info!("refresh requested but vault is locked; nothing to do yet");
+                return Ok(());
+            }
+            State::Unlocked { session, .. } => Arc::clone(session),
+        };
+
+        log::info!("refreshing vault: re-syncing and reloading SSH keys");
+        let keys = self.load_keys(&session).await?;
+        *state = State::Unlocked { session, keys };
+        Ok(())
     }
 
     /// At startup, try to unlock non-interactively using a systemd credential.
@@ -81,16 +112,20 @@ impl UnlockManager {
         };
 
         log::info!("found master password credential; unlocking vault at startup");
-        let keys = self.unlock_and_load(&password).await?;
+        let (session, keys) = self.unlock_and_load(&password).await?;
         let count = keys.len();
         let mut state = self.inner.state.lock().await;
-        *state = State::Unlocked(keys);
+        *state = State::Unlocked { session, keys };
         log::info!("vault unlocked at startup; cached {count} SSH key(s)");
         Ok(true)
     }
 
-    /// Perform the full login + unlock + load-keys flow for a given password.
-    async fn unlock_and_load(&self, password: &SecretString) -> Result<Arc<Vec<VaultKey>>> {
+    /// Perform the full login + unlock + load-keys flow for a given password,
+    /// returning the live session (retained for later refreshes) and the keys.
+    async fn unlock_and_load(
+        &self,
+        password: &SecretString,
+    ) -> Result<(Arc<Session>, Arc<Vec<VaultKey>>)> {
         match &self.inner.api_key {
             Some(api_key) => self.inner.cli.login_with_api_key(api_key).await?,
             None => {
@@ -106,17 +141,22 @@ impl UnlockManager {
             }
         }
 
-        let session = self.inner.cli.unlock(password).await?;
+        let session = Arc::new(self.inner.cli.unlock(password).await?);
+        let keys = self.load_keys(&session).await?;
+        Ok((session, keys))
+    }
 
+    /// Sync the vault and (re)load its SSH Key items using an existing session.
+    async fn load_keys(&self, session: &Session) -> Result<Arc<Vec<VaultKey>>> {
         // Best-effort sync so freshly-added keys are visible.
-        if let Err(e) = self.inner.cli.sync(&session).await {
+        if let Err(e) = self.inner.cli.sync(session).await {
             log::warn!("vault sync failed (continuing with cached data): {e:#}");
         }
 
         let items = self
             .inner
             .cli
-            .list_ssh_keys(&session)
+            .list_ssh_keys(session)
             .await
             .context("listing SSH keys from vault")?;
 
