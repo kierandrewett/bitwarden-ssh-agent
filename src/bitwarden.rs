@@ -31,6 +31,8 @@ impl Session {
 /// A single SSH Key item from the vault (Bitwarden cipher type 5).
 #[derive(Debug, Deserialize)]
 pub struct SshKeyItem {
+    /// Vault item UUID (kept for logging/diagnostics).
+    #[allow(dead_code)]
     pub id: String,
     pub name: String,
     #[serde(rename = "sshKey")]
@@ -38,12 +40,17 @@ pub struct SshKeyItem {
 }
 
 /// The `sshKey` object attached to an SSH Key cipher.
+///
+/// Only `private_key` is required for signing; `public_key` and
+/// `key_fingerprint` are captured for completeness and diagnostics.
 #[derive(Debug, Deserialize)]
 pub struct SshKeyData {
     #[serde(rename = "privateKey")]
     pub private_key: String,
+    #[allow(dead_code)]
     #[serde(rename = "publicKey")]
     pub public_key: String,
+    #[allow(dead_code)]
     #[serde(rename = "keyFingerprint", default)]
     pub key_fingerprint: Option<String>,
 }
