@@ -115,6 +115,48 @@ The remaining sections document the same steps done by hand, for anyone who
 wants to see exactly what `setup` automates, doesn't use systemd, or prefers to
 manage the pieces themselves.
 
+## Import existing keys: `bitwarden-ssh-agent import`
+
+Already have SSH private keys in `~/.ssh` (e.g. `id_ed25519`) that you want in
+your vault? Rather than pasting each one into the web vault by hand — which has
+no reliable "import from clipboard" button (only the desktop app and browser
+extension do) — this subcommand imports them for you with a wizard, so you stay
+in control:
+
+```sh
+bitwarden-ssh-agent import          # add --dry-run to preview, changing nothing
+```
+
+It:
+
+1. **Scans `~/.ssh`** for files that parse as OpenSSH private keys (skipping
+   `known_hosts`, `config`, `authorized_keys`, `*.pub`, and anything that isn't
+   a key). For each it shows the path, algorithm, `SHA256:` fingerprint,
+   comment, whether it's **passphrase-protected**, and whether it's **already in
+   your vault**.
+2. **Unlocks its own `bw` session** (prompting, masked, for your master
+   password — the same as `unlock`; nothing is stored) and lists the SSH Key
+   items already present so duplicates are flagged, not re-added.
+3. **Lets you pick exactly which keys to import** with a multi-select list
+   (pre-selecting the ones not already in the vault and not passphrase-
+   protected). Per key it then asks, as needed:
+   - **already in the vault?** skip, or overwrite the existing item in place.
+   - **passphrase-protected?** the agent can't yet sign with encrypted keys, so
+     you choose: *decrypt now* (enter the passphrase; the decrypted key is
+     stored so the agent can use it — protected at rest by Bitwarden's own
+     encryption, the same as every other vault key), *store the encrypted blob*
+     (backup only, unusable until decrypted), or *skip*.
+   - the **item name** (defaults to something like `id_ed25519 (user@host)`).
+4. **Creates the items** via the `bw` CLI (the private key is piped through
+   stdin, never the command line) and prints a summary of what was created,
+   overwritten, skipped, and why.
+5. If the daemon is running, **offers to send it a `SIGHUP`** so the new keys are
+   served immediately without a restart.
+
+`--dry-run` runs the entire wizard but prints what it *would* create instead of
+touching the vault, so you can preview safely first. `--ssh-dir <PATH>` scans a
+different directory.
+
 ## Manual setup
 
 ### Configure the API key
@@ -241,16 +283,21 @@ Other environment variables:
 ## CLI
 
 ```
-bitwarden-ssh-agent setup [--config <PATH>]
-bitwarden-ssh-agent serve [--socket <PATH>] [--config <PATH>]
+bitwarden-ssh-agent setup  [--config <PATH>]
+bitwarden-ssh-agent serve  [--socket <PATH>] [--config <PATH>]
+bitwarden-ssh-agent unlock [--control-socket <PATH>]
+bitwarden-ssh-agent import [--ssh-dir <PATH>] [--config <PATH>] [--dry-run]
 ```
 
 `setup` runs the interactive one-command configuration flow (see
 [Quick start](#quick-start-bitwarden-ssh-agent-setup-recommended)). `serve` runs
 the daemon: `--socket` overrides the socket path and `--config` overrides the
-config file location. A subcommand is required — running the bare command with
-no subcommand prints help and exits without starting the daemon. Run `--help`
-for details.
+config file location. `unlock` unlocks a running daemon from your terminal.
+`import` brings existing `~/.ssh` private keys into the vault as SSH Key items
+(see [Import existing keys](#import-existing-keys-bitwarden-ssh-agent-import));
+`--dry-run` previews without changing anything. A subcommand is required —
+running the bare command with no subcommand prints help and exits without
+starting the daemon. Run `--help` for details.
 
 ## Troubleshooting
 
