@@ -8,6 +8,7 @@
 //! Every destructive step (overwriting the config, the unit file, or an existing
 //! credential) prompts first, so re-running `setup` is safe and idempotent.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -71,7 +72,7 @@ async fn ensure_bw_cli() -> Result<()> {
     let cli = BitwardenCli::new(None);
     match cli.version().await {
         Ok(v) => {
-            println!("Found Bitwarden CLI (version {v}).");
+            println!("{} Found Bitwarden CLI (version {v}).", ok_mark());
             return Ok(());
         }
         Err(_) => {
@@ -114,7 +115,7 @@ async fn ensure_bw_cli() -> Result<()> {
     // Confirm the freshly-installed binary is actually reachable now.
     match cli.version().await {
         Ok(v) => {
-            println!("Installed Bitwarden CLI (version {v}).");
+            println!("{} Installed Bitwarden CLI (version {v}).", ok_mark());
             Ok(())
         }
         Err(_) => anyhow::bail!(
@@ -153,10 +154,14 @@ async fn collect_and_validate_api_key() -> Result<ApiKeyInput> {
             client_secret: client_secret.clone(),
         };
 
-        println!("\nValidating with `bw login --apikey`...");
-        match validate_api_key(&api_key, server.as_deref()).await {
+        let validation = with_spinner(
+            "Validating with `bw login --apikey`...",
+            validate_api_key(&api_key, server.as_deref()),
+        )
+        .await;
+        match validation {
             Ok(()) => {
-                println!("API key accepted; device is now logged in to Bitwarden.");
+                println!("{} API key accepted; device is now logged in to Bitwarden.", ok_mark());
                 return Ok(ApiKeyInput {
                     client_id,
                     client_secret,
@@ -239,7 +244,7 @@ fn write_config(path: &std::path::Path, api_key: &ApiKeyInput) -> Result<()> {
     // The serialized body contains the API secret; scrub our copy.
     contents.zeroize();
 
-    println!("Wrote config file with 0600 permissions.");
+    println!("{} Wrote config file with 0600 permissions.", ok_mark());
     Ok(())
 }
 
@@ -302,7 +307,7 @@ async fn provision_master_password(
     let password = prompt_master_password_verified(api_key).await?;
 
     encrypt_master_password_credential(&password, &cred_path).await?;
-    println!("Wrote encrypted credential to {} (0600).", cred_path.display());
+    println!("{} Wrote encrypted credential to {} (0600).", ok_mark(), cred_path.display());
     Ok(UnlockStrategy::Credential)
 }
 
@@ -313,11 +318,14 @@ async fn prompt_master_password_verified(api_key: &ApiKeyInput) -> Result<Secret
     loop {
         let password = SecretString::from(prompt_new_password("Bitwarden master password:")?);
 
-        println!("Verifying with `bw unlock`...");
-        match cli.unlock(&password).await {
+        let unlocked = with_spinner("Verifying with `bw unlock`...", cli.unlock(&password)).await;
+        match unlocked {
             // The returned session is dropped (zeroized) immediately; we only
             // needed to confirm the password works.
-            Ok(_session) => return Ok(password),
+            Ok(_session) => {
+                println!("{} Master password verified.", ok_mark());
+                return Ok(password);
+            }
             Err(e) => {
                 println!("\nUnlock failed:\n{e:#}\n");
                 if !prompt_yes_no("Try a different password?", true)? {
@@ -427,7 +435,7 @@ fn install_systemd_unit(
     std::fs::write(&unit_path, unit)
         .with_context(|| format!("writing unit file {}", unit_path.display()))?;
 
-    println!("Installed unit with ExecStart={} serve", exe.display());
+    println!("{} Installed unit with ExecStart={} serve", ok_mark(), exe.display());
     Ok(unit_path)
 }
 
@@ -479,7 +487,7 @@ fn render_unit(
 /// Print the `SSH_AUTH_SOCK` export line the user must add to their shell rc.
 /// We deliberately do NOT edit their rc file; we just show the exact line.
 fn print_ssh_auth_sock() {
-    step(7, "Point SSH at the agent");
+    done_banner("Point SSH at the agent");
 
     let (rc_hint, line) = shell_rc_hint();
 
@@ -524,8 +532,11 @@ fn shell_rc_hint() -> (String, &'static str) {
 async fn enable_and_start() -> Result<()> {
     step(6, "Enable and start the service");
 
-    run_systemctl(&["daemon-reload"]).await?;
-    run_systemctl(&["enable", "--now", UNIT_FILENAME]).await?;
+    with_spinner("Reloading systemd and enabling the service...", async {
+        run_systemctl(&["daemon-reload"]).await?;
+        run_systemctl(&["enable", "--now", UNIT_FILENAME]).await
+    })
+    .await?;
 
     // `is-active` exits non-zero when not active, so inspect stdout directly.
     let out = Command::new("systemctl")
@@ -537,7 +548,7 @@ async fn enable_and_start() -> Result<()> {
     let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
 
     if state == "active" {
-        println!("Service is active and running.");
+        println!("{} Service is active and running.", ok_mark());
     } else {
         println!(
             "\nThe service is not active (state: {}).\n\
@@ -622,10 +633,61 @@ async fn program_runs(program: &str, args: &[&str]) -> bool {
 
 // --- terminal helpers -------------------------------------------------------
 
-/// Print a step header so the user can follow along.
+/// Total number of numbered steps in the wizard (the final "point SSH at the
+/// agent" hint is a closing note, not a numbered action step).
+const TOTAL_STEPS: u8 = 6;
+
+/// Print a colored, progress-numbered step banner so the user can follow along.
 fn step(n: u8, title: &str) {
-    println!("\n[{n}/7] {title}");
-    println!("{}", "-".repeat(title.len() + 6));
+    println!();
+    println!("{}", bold_cyan(&format!("Step {n}/{TOTAL_STEPS}: {title}")));
+}
+
+/// Print the final completion banner (unnumbered; setup's work is already done).
+fn done_banner(title: &str) {
+    println!();
+    println!("{}", bold_cyan(&format!("Done: {title}")));
+}
+
+/// Whether stdout is a terminal, so ANSI color is worth emitting.
+fn color_enabled() -> bool {
+    std::io::stdout().is_terminal()
+}
+
+/// Wrap `s` in bold cyan when writing to a terminal, else return it plain.
+fn bold_cyan(s: &str) -> String {
+    if color_enabled() {
+        format!("\x1b[1;36m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+/// A green check mark (plain "OK" markers stay legible when piped).
+fn ok_mark() -> &'static str {
+    if color_enabled() {
+        "\x1b[32m✓\x1b[0m"
+    } else {
+        "✓"
+    }
+}
+
+/// Run an async operation while showing a steady spinner, clearing it on
+/// completion so the caller can print its own success/failure line. The spinner
+/// hides itself automatically when stdout/stderr is not a terminal.
+async fn with_spinner<F, T>(message: &str, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let pb = indicatif::ProgressBar::new_spinner();
+    if let Ok(style) = indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}") {
+        pb.set_style(style);
+    }
+    pb.set_message(message.to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(90));
+    let out = fut.await;
+    pb.finish_and_clear();
+    out
 }
 
 /// Prompt for a free-form line of text. With a default, an empty submission
