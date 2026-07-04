@@ -601,7 +601,7 @@ async fn execute_plans(
             .any(|p| matches!(p, KeyPlan::Create { .. }));
     let template = if will_create {
         Some(
-            cli.item_template()
+            with_spinner("Fetching the `bw` item template...", cli.item_template())
                 .await
                 .context("fetching the `bw` item template")?,
         )
@@ -625,7 +625,12 @@ async fn execute_plans(
                 }
                 let base = template.clone().expect("template fetched when creating");
                 let item = build_item_value(base, name, payload);
-                match cli.create_item(session, &item).await {
+                match with_spinner(
+                    &format!("Creating vault item \"{name}\"..."),
+                    cli.create_item(session, &item),
+                )
+                .await
+                {
                     Ok(id) => {
                         println!("created:         {name}  (id {id})");
                         created.push(name.clone());
@@ -642,7 +647,12 @@ async fn execute_plans(
                     overwritten.push(name.clone());
                     continue;
                 }
-                match overwrite_item(cli, session, id, name, payload).await {
+                match with_spinner(
+                    &format!("Overwriting vault item \"{name}\"..."),
+                    overwrite_item(cli, session, id, name, payload),
+                )
+                .await
+                {
                     Ok(()) => {
                         println!("overwritten:     {name}  (id {id})");
                         overwritten.push(name.clone());
@@ -737,12 +747,14 @@ async fn open_vault_session(config: Option<PathBuf>) -> Result<(BitwardenCli, Se
 
     // Ensure the device is logged in.
     match &cfg.api_key {
-        Some(api_key) => cli
-            .login_with_api_key(api_key)
-            .await
-            .context("logging in to Bitwarden with the configured API key")?,
+        Some(api_key) => with_spinner(
+            "Logging in to Bitwarden with the configured API key...",
+            cli.login_with_api_key(api_key),
+        )
+        .await
+        .context("logging in to Bitwarden with the configured API key")?,
         None => {
-            let status = cli.status().await?;
+            let status = with_spinner("Checking Bitwarden login status...", cli.status()).await?;
             if status.status == "unauthenticated" {
                 anyhow::bail!(
                     "no Bitwarden API key configured and the `bw` CLI is not logged in; \
@@ -757,8 +769,11 @@ async fn open_vault_session(config: Option<PathBuf>) -> Result<(BitwardenCli, Se
     println!("and never written to disk or logged) to unlock the vault:\n");
     loop {
         let password = SecretString::from(prompt_secret("Bitwarden master password:")?);
-        match cli.unlock(&password).await {
-            Ok(session) => return Ok((cli, session)),
+        match with_spinner("Unlocking your vault...", cli.unlock(&password)).await {
+            Ok(session) => {
+                println!("{} Vault unlocked.", ok_mark());
+                return Ok((cli, session));
+            }
             Err(e) => {
                 println!("Unlock failed: {e:#}");
                 if !prompt_yes_no("Try a different master password?", true)? {
