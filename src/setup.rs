@@ -46,7 +46,8 @@ pub async fn run(config_override: Option<PathBuf>) -> Result<()> {
     let api_key = collect_and_validate_api_key().await?;
     write_config(&config_path, &api_key)?;
     let strategy = provision_master_password(&config_path, &api_key).await?;
-    let _unit_path = install_systemd_unit(&config_path, strategy)?;
+    install_systemd_unit(&config_path, strategy)?;
+    enable_and_start().await?;
 
     Ok(())
 }
@@ -484,6 +485,59 @@ fn render_unit(
          WantedBy=default.target\n",
         exe = exe.display(),
     )
+}
+
+// --- step 6: enable and start ------------------------------------------------
+
+/// Reload systemd, enable+start the service, and report whether it came up.
+async fn enable_and_start() -> Result<()> {
+    step(6, "Enable and start the service");
+
+    run_systemctl(&["daemon-reload"]).await?;
+    run_systemctl(&["enable", "--now", UNIT_FILENAME]).await?;
+
+    // `is-active` exits non-zero when not active, so inspect stdout directly.
+    let out = Command::new("systemctl")
+        .args(["--user", "is-active", UNIT_FILENAME])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("running `systemctl --user is-active`")?;
+    let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    if state == "active" {
+        println!("Service is active and running.");
+    } else {
+        println!(
+            "\nThe service is not active (state: {}).\n\
+             Inspect the logs with:\n  \
+             journalctl --user -u {} -e",
+            if state.is_empty() { "unknown" } else { &state },
+            UNIT_FILENAME
+        );
+        anyhow::bail!("service failed to start; see the logs above");
+    }
+    Ok(())
+}
+
+/// Run `systemctl --user <args...>`, failing loudly on a non-zero exit.
+async fn run_systemctl(args: &[&str]) -> Result<()> {
+    let mut full = vec!["--user"];
+    full.extend_from_slice(args);
+    let out = Command::new("systemctl")
+        .args(&full)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("running `systemctl {}`", full.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`systemctl {}` failed: {}",
+            full.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// `$XDG_CONFIG_HOME/systemd/user` (or `~/.config/systemd/user`).
