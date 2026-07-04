@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use secrecy::SecretString;
 use serde::Deserialize;
+use zeroize::Zeroize;
 
 /// Bitwarden device API credentials (personal API key).
 pub struct ApiKey {
@@ -108,11 +109,14 @@ fn read_config_file(path: &Path) -> Result<Option<ConfigFile>> {
 
     check_permissions(path)?;
 
-    let contents = std::fs::read_to_string(path)
+    let mut contents = std::fs::read_to_string(path)
         .with_context(|| format!("reading config file {}", path.display()))?;
-    let parsed: ConfigFile = toml::from_str(&contents)
-        .with_context(|| format!("parsing config file {}", path.display()))?;
-    Ok(Some(parsed))
+    // The raw file holds `client_secret`; zeroize it once parsed (on both the
+    // success and error paths), consistent with how other secrets are handled.
+    let parsed = toml::from_str::<ConfigFile>(&contents)
+        .with_context(|| format!("parsing config file {}", path.display()));
+    contents.zeroize();
+    Ok(Some(parsed?))
 }
 
 /// Refuse to read a config file that is readable by group or other, since it may
