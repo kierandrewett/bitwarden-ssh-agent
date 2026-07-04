@@ -97,15 +97,19 @@ anything, so it is safe to re-run):
    `bw login --apikey` before writing anything.
 3. **Writes `~/.config/bitwarden-ssh-agent/config.toml`** with `0600`
    permissions.
-4. **Sets up the master-password unlock strategy** — either auto-unlock via an
-   encrypted systemd credential (it prompts for the password with masked input,
-   verifies it unlocks the vault, then pipes it straight into
-   `systemd-creds encrypt`; the plaintext never touches disk or your shell
-   history), or on-demand prompting via `systemd-ask-password`.
+4. **Sets up master-password unlock** — asks a single yes/no: set up
+   auto-unlock at startup? If yes, it provisions an encrypted systemd
+   credential (prompting for the password with masked input, verifying it
+   unlocks the vault, then piping it straight into `systemd-creds encrypt`; the
+   plaintext never touches disk or your shell history). Either way, the daemon
+   *always* falls back to prompting via `systemd-ask-password` whenever it
+   starts without a valid credential — that's inherent daemon behavior, not a
+   separate mode you choose.
 5. **Installs the `systemd --user` unit** with `ExecStart=` pointing at the
    binary you just built.
 6. **Enables and starts** the service and checks it came up.
-7. **Prints the `SSH_AUTH_SOCK` line** to add to your shell rc.
+
+Finally it **prints the `SSH_AUTH_SOCK` line** to add to your shell rc.
 
 The remaining sections document the same steps done by hand, for anyone who
 wants to see exactly what `setup` automates, doesn't use systemd, or prefers to
