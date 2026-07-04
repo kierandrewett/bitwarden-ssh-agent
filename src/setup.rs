@@ -8,7 +8,6 @@
 //! Every destructive step (overwriting the config, the unit file, or an existing
 //! credential) prompts first, so re-running `setup` is safe and idempotent.
 
-use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -139,7 +138,7 @@ async fn collect_and_validate_api_key() -> Result<ApiKeyInput> {
 
     loop {
         let client_id = prompt("client_id (starts with `user.`)", None)?;
-        let client_secret = SecretString::from(prompt("client_secret", None)?);
+        let client_secret = SecretString::from(prompt_secret_once("client_secret")?);
         println!("\nSelf-hosted Bitwarden/Vaultwarden only. Leave blank for the");
         println!("official Bitwarden cloud (bitwarden.com).");
         let server_raw = prompt("server URL (optional)", Some(""))?;
@@ -312,13 +311,7 @@ async fn provision_master_password(
 async fn prompt_master_password_verified(api_key: &ApiKeyInput) -> Result<SecretString> {
     let cli = BitwardenCli::new(api_key.server.clone());
     loop {
-        let entered = rpassword::prompt_password("Bitwarden master password: ")
-            .context("reading master password")?;
-        if entered.is_empty() {
-            println!("Password was empty; please try again.");
-            continue;
-        }
-        let password = SecretString::from(entered);
+        let password = SecretString::from(prompt_new_password("Bitwarden master password:")?);
 
         println!("Verifying with `bw unlock`...");
         match cli.unlock(&password).await {
@@ -635,36 +628,37 @@ fn step(n: u8, title: &str) {
     println!("{}", "-".repeat(title.len() + 6));
 }
 
-/// Read a line of input, returning it trimmed. `None` on EOF.
-fn read_line() -> Result<Option<String>> {
-    let mut line = String::new();
-    let n = io::stdin().read_line(&mut line)?;
-    if n == 0 {
-        return Ok(None);
-    }
-    Ok(Some(line.trim().to_string()))
+/// Prompt for a free-form line of text. With a default, an empty submission
+/// returns it; without one, the field is required (inquire re-asks on empty).
+fn prompt(question: &str, default: Option<&str>) -> Result<String> {
+    let text = inquire::Text::new(question);
+    let text = match default {
+        Some(d) => text.with_default(d),
+        None => text.with_validator(inquire::required!("this field is required")),
+    };
+    text.prompt().map(|s| s.trim().to_string()).map_err(map_inquire_err)
 }
 
-/// Prompt for a free-form line of text (optionally with a default).
-fn prompt(question: &str, default: Option<&str>) -> Result<String> {
-    loop {
-        match default {
-            Some(d) if !d.is_empty() => print!("{question} [{d}]: "),
-            _ => print!("{question}: "),
-        }
-        io::stdout().flush()?;
-        match read_line()? {
-            None => anyhow::bail!("aborted (end of input)"),
-            Some(s) if s.is_empty() => {
-                if let Some(d) = default {
-                    return Ok(d.to_string());
-                }
-                // Required field: re-ask.
-                continue;
-            }
-            Some(s) => return Ok(s),
-        }
-    }
+/// Prompt once (masked) for a secret, with no confirmation retype. Suitable for
+/// values that are validated immediately afterwards (e.g. the API client_secret).
+fn prompt_secret_once(question: &str) -> Result<String> {
+    inquire::Password::new(question)
+        .with_display_mode(inquire::PasswordDisplayMode::Masked)
+        .without_confirmation()
+        .prompt()
+        .map_err(map_inquire_err)
+}
+
+/// Prompt (masked) for a new secret the user is entering fresh, requiring a
+/// confirmation retype so an unnoticed typo can't get baked in. Used for the
+/// master password, where a typo is expensive to debug later.
+fn prompt_new_password(question: &str) -> Result<String> {
+    inquire::Password::new(question)
+        .with_display_mode(inquire::PasswordDisplayMode::Masked)
+        .with_custom_confirmation_message("Confirm — retype to catch typos:")
+        .with_validator(inquire::required!("password must not be empty"))
+        .prompt()
+        .map_err(map_inquire_err)
 }
 
 /// Prompt the user to pick one of several named options via an arrow-key menu.
