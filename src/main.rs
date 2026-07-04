@@ -9,6 +9,7 @@ mod agent;
 mod bitwarden;
 mod config;
 mod control;
+mod import;
 mod setup;
 mod unlock;
 
@@ -57,6 +58,33 @@ enum Command {
     /// required). Prompts for the password and hands it to the daemon over its
     /// local control socket.
     Unlock(UnlockArgs),
+
+    /// Interactively import existing SSH private keys from `~/.ssh` into your
+    /// Bitwarden vault as "SSH Key" items, so this daemon can serve them.
+    ///
+    /// Scans for private keys, shows type/fingerprint/comment and whether each
+    /// is passphrase-protected or already in the vault, then lets you pick
+    /// exactly which to import (a wizard, so you stay in control). Pass
+    /// `--dry-run` to preview everything without creating any vault items.
+    Import(ImportArgs),
+}
+
+#[derive(clap::Args)]
+struct ImportArgs {
+    /// Directory to scan for SSH private keys.
+    /// Defaults to `~/.ssh`.
+    #[arg(long, value_name = "PATH")]
+    ssh_dir: Option<PathBuf>,
+
+    /// Path to the config file (Bitwarden API key).
+    /// Defaults to `~/.config/bitwarden-ssh-agent/config.toml`.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Preview only: discover keys and run the whole wizard, but print what
+    /// would be created instead of actually creating any vault items.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(clap::Args)]
@@ -101,6 +129,7 @@ async fn main() -> Result<()> {
         Command::Serve(args) => serve(args).await,
         Command::Setup(args) => setup::run(args.config).await,
         Command::Unlock(args) => unlock_cli(args).await,
+        Command::Import(args) => import::run(args.ssh_dir, args.config, args.dry_run).await,
     }
 }
 
