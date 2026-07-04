@@ -97,27 +97,45 @@ impl VaultKey {
 }
 
 /// Produce an RSA PKCS#1 v1.5 signature with the requested SHA-2 hash.
+///
+/// NOTE: we deliberately do **not** use ssh-key's `TryFrom<&RsaKeypair> for
+/// rsa::RsaPrivateKey` (nor its `Signer` impl, which relies on it). In ssh-key
+/// 0.6.7 that conversion passes prime `p` twice instead of `p` and `q`, so
+/// every RSA signature it produces fails. We build the `rsa` private key from
+/// the raw components (n, e, d, p, q) ourselves to get correct signatures.
 fn sign_rsa(
     keypair: &ssh_key::private::RsaKeypair,
     data: &[u8],
     hash: HashAlg,
 ) -> Result<Signature> {
     use rsa::pkcs1v15::SigningKey;
+    use rsa::{BigUint, RsaPrivateKey};
     use signature::{SignatureEncoding, Signer};
     use ssh_key::sha2::{Sha256, Sha512};
 
+    let n = BigUint::try_from(&keypair.public.n).context("RSA modulus")?;
+    let e = BigUint::try_from(&keypair.public.e).context("RSA exponent")?;
+    let d = BigUint::try_from(&keypair.private.d).context("RSA private exponent")?;
+    let p = BigUint::try_from(&keypair.private.p).context("RSA prime p")?;
+    let q = BigUint::try_from(&keypair.private.q).context("RSA prime q")?;
+
+    let mut private_key = RsaPrivateKey::from_components(n, e, d, vec![p, q])
+        .context("reconstructing RSA private key")?;
+    // Precompute CRT parameters so signing is fast.
+    private_key
+        .precompute()
+        .context("precomputing RSA CRT values")?;
+
     let raw = match hash {
-        HashAlg::Sha256 => {
-            let signer = SigningKey::<Sha256>::try_from(keypair)
-                .context("building RSA/SHA-256 signer")?;
-            signer.try_sign(data).context("RSA/SHA-256 sign")?.to_vec()
-        }
+        HashAlg::Sha256 => SigningKey::<Sha256>::new(private_key)
+            .try_sign(data)
+            .context("RSA/SHA-256 sign")?
+            .to_vec(),
         // Default and explicit SHA-512.
-        _ => {
-            let signer = SigningKey::<Sha512>::try_from(keypair)
-                .context("building RSA/SHA-512 signer")?;
-            signer.try_sign(data).context("RSA/SHA-512 sign")?.to_vec()
-        }
+        _ => SigningKey::<Sha512>::new(private_key)
+            .try_sign(data)
+            .context("RSA/SHA-512 sign")?
+            .to_vec(),
     };
 
     Signature::new(Algorithm::Rsa { hash: Some(hash) }, raw)
@@ -156,5 +174,73 @@ impl Session for VaultAgent {
             .find(|k| k.matches(&request.credential))
             .ok_or_else(|| agent_err(anyhow!("requested key not held by agent")))?;
         key.sign(&request.data, request.flags).map_err(agent_err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use signature::Verifier;
+    use ssh_key::rand_core::OsRng;
+
+    fn item_for(private: &PrivateKey, name: &str) -> SshKeyItem {
+        let pem = private
+            .to_openssh(ssh_key::LineEnding::LF)
+            .expect("serialize openssh")
+            .to_string();
+        let public = private.public_key().to_openssh().expect("serialize pub");
+        // Build via JSON to mirror the real `bw` output path.
+        serde_json::from_value(serde_json::json!({
+            "id": "test-id",
+            "name": name,
+            "sshKey": {
+                "privateKey": pem,
+                "publicKey": public,
+                "keyFingerprint": null,
+            },
+        }))
+        .expect("deserialize SshKeyItem")
+    }
+
+    #[test]
+    fn ed25519_round_trip() {
+        let private = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let item = item_for(&private, "ed-key");
+        let key = VaultKey::from_item(&item).unwrap();
+
+        // Identity is advertised with the right comment and public key.
+        let ident = key.identity();
+        assert_eq!(ident.comment, "ed-key");
+        assert!(key.matches(&ident.credential));
+
+        let data = b"hello ssh agent";
+        let sig = key.sign(data, 0).unwrap();
+        Verifier::verify(private.public_key(), data, &sig).unwrap();
+    }
+
+    #[test]
+    fn rsa_honours_sha2_flags() {
+        let private = PrivateKey::random(
+            &mut OsRng,
+            Algorithm::Rsa { hash: None },
+        )
+        .unwrap();
+        let item = item_for(&private, "rsa-key");
+        let key = VaultKey::from_item(&item).unwrap();
+        let data = b"sign me";
+        let pubkey = private.public_key();
+
+        let sig256 = key.sign(data, RSA_SHA2_256).unwrap();
+        assert_eq!(sig256.algorithm(), Algorithm::Rsa { hash: Some(HashAlg::Sha256) });
+        Verifier::verify(pubkey, data, &sig256).unwrap();
+
+        let sig512 = key.sign(data, RSA_SHA2_512).unwrap();
+        assert_eq!(sig512.algorithm(), Algorithm::Rsa { hash: Some(HashAlg::Sha512) });
+        Verifier::verify(pubkey, data, &sig512).unwrap();
+
+        // No flags: default to SHA-512 (never legacy SHA-1 ssh-rsa).
+        let sig_default = key.sign(data, 0).unwrap();
+        assert_eq!(sig_default.algorithm(), Algorithm::Rsa { hash: Some(HashAlg::Sha512) });
+        Verifier::verify(pubkey, data, &sig_default).unwrap();
     }
 }
