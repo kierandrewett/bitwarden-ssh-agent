@@ -76,12 +76,28 @@ impl VaultKey {
     fn sign(&self, data: &[u8], flags: u32) -> Result<Signature> {
         match self.private.key_data() {
             KeypairData::Rsa(keypair) => {
-                // Modern OpenSSH always requests rsa-sha2-256/512; never sign
-                // with the deprecated SHA-1 `ssh-rsa`. Default to SHA-512.
+                // Choose the RSA signature hash from the client's flag bits
+                // (draft-miller-ssh-agent § 3.6.1): SHA-256 if rsa-sha2-256 was
+                // requested, otherwise SHA-512.
+                //
+                // A client that sets neither bit (flags == 0) is really asking
+                // for a legacy `ssh-rsa` (SHA-1) signature, which we would like
+                // to honour for interop with pre-OpenSSH-7.2 servers. We cannot:
+                // ssh-key 0.6.7 refuses to build a legacy signature —
+                // `Signature::new(Algorithm::Rsa { hash: None }, ..)` returns
+                // `Error::Length` — and there is no semver-compatible release
+                // that lifts this (0.7 is a pre-release and is ABI-incompatible
+                // with ssh-agent-lib 0.6, which shares this `Signature` type).
+                // Emitting SHA-512 bytes under an `ssh-rsa` label would be an
+                // invalid signature, and erroring out would break every
+                // non-OpenSSH client that sends flags == 0 yet accepts SHA-2.
+                // So flags == 0 falls back to SHA-512, which modern servers
+                // accept; genuine legacy `ssh-rsa` interop is impossible until
+                // the library can represent it.
                 let hash = if flags & RSA_SHA2_256 != 0 {
                     HashAlg::Sha256
                 } else {
-                    let _ = flags & RSA_SHA2_512; // 512 is our default anyway
+                    let _ = flags & RSA_SHA2_512; // SHA-512 is the fallback here
                     HashAlg::Sha512
                 };
                 sign_rsa(keypair, data, hash)
@@ -238,7 +254,9 @@ mod tests {
         assert_eq!(sig512.algorithm(), Algorithm::Rsa { hash: Some(HashAlg::Sha512) });
         Verifier::verify(pubkey, data, &sig512).unwrap();
 
-        // No flags: default to SHA-512 (never legacy SHA-1 ssh-rsa).
+        // No flags (flags == 0): a legacy `ssh-rsa` (SHA-1) signature is what
+        // the client is asking for, but ssh-key 0.6.7 cannot represent that, so
+        // we fall back to SHA-512 rather than erroring. See `VaultKey::sign`.
         let sig_default = key.sign(data, 0).unwrap();
         assert_eq!(sig_default.algorithm(), Algorithm::Rsa { hash: Some(HashAlg::Sha512) });
         Verifier::verify(pubkey, data, &sig_default).unwrap();
