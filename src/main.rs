@@ -8,6 +8,7 @@
 mod agent;
 mod bitwarden;
 mod config;
+mod setup;
 mod unlock;
 
 use std::path::PathBuf;
@@ -42,6 +43,18 @@ struct Cli {
 enum Command {
     /// Run the agent daemon (this is what systemd runs). Also the default.
     Serve(ServeArgs),
+
+    /// Interactively configure everything: `bw` CLI, API key, config file,
+    /// master-password unlock strategy, and the systemd user service.
+    Setup(SetupArgs),
+}
+
+#[derive(clap::Args)]
+struct SetupArgs {
+    /// Path to the config file to write.
+    /// Defaults to `~/.config/bitwarden-ssh-agent/config.toml`.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -68,6 +81,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Serve(args)) => serve(args).await,
+        Some(Command::Setup(args)) => setup::run(args.config).await,
         None => serve(ServeArgs { socket: None, config: None }).await,
     }
 }
