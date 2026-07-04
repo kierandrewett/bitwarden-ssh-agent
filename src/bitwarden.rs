@@ -335,12 +335,12 @@ impl BitwardenCli {
         session: &Session,
         item: &serde_json::Value,
     ) -> Result<String> {
-        let encoded = self.encode_item(item).await?;
+        let mut encoded = self.encode_item(item).await?;
         let out = self
             .run_capturing_stdin(&["create", "item"], Some(session), &encoded)
-            .await
-            .context("running `bw create item`")?;
-        parse_item_id(&out)
+            .await;
+        encoded.zeroize();
+        parse_item_id(&out.context("running `bw create item`")?)
     }
 
     /// Replace an existing vault item in place (`bw edit item <id>`). Same
@@ -351,12 +351,12 @@ impl BitwardenCli {
         id: &str,
         item: &serde_json::Value,
     ) -> Result<String> {
-        let encoded = self.encode_item(item).await?;
+        let mut encoded = self.encode_item(item).await?;
         let out = self
             .run_capturing_stdin(&["edit", "item", id], Some(session), &encoded)
-            .await
-            .context("running `bw edit item`")?;
-        parse_item_id(&out)
+            .await;
+        encoded.zeroize();
+        parse_item_id(&out.context("running `bw edit item`")?)
     }
 
     /// Serialize `item` to JSON and base64-encode it via `bw encode` (fed on

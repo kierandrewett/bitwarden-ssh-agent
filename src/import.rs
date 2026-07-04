@@ -635,13 +635,14 @@ async fn execute_plans(
                     continue;
                 }
                 let base = template.clone().expect("template fetched when creating");
-                let item = build_item_value(base, name, notes.as_deref(), payload);
-                match with_spinner(
+                let mut item = build_item_value(base, name, notes.as_deref(), payload);
+                let result = with_spinner(
                     &format!("Creating vault item \"{name}\"..."),
                     cli.create_item(session, &item),
                 )
-                .await
-                {
+                .await;
+                zeroize_item_private_key(&mut item);
+                match result {
                     Ok(id) => {
                         println!("created:         {name}  (id {id})");
                         created.push(name.clone());
@@ -717,8 +718,10 @@ async fn overwrite_item(
     // is already there", not "clear it" — only override if the user typed one.
     let kept_notes = existing.get("notes").and_then(|v| v.as_str()).map(str::to_string);
     let notes = notes.map(str::to_string).or(kept_notes);
-    let item = build_item_value(existing, name, notes.as_deref(), payload);
-    cli.edit_item(session, id, &item).await?;
+    let mut item = build_item_value(existing, name, notes.as_deref(), payload);
+    let result = cli.edit_item(session, id, &item).await;
+    zeroize_item_private_key(&mut item);
+    result?;
     Ok(())
 }
 
@@ -755,6 +758,23 @@ fn build_item_value(
         map.insert(key.to_string(), Value::Null);
     }
     Value::Object(map)
+}
+
+/// Scrub the private key out of a constructed item `Value` in place. `item`
+/// carries plaintext key material (built by [`build_item_value`]) for exactly
+/// as long as it takes to encode/send it to `bw`; once that's done, this wipes
+/// the in-memory copy rather than leaving it for the allocator to reclaim
+/// un-scrubbed, matching the zeroize hygiene used for every other secret here.
+fn zeroize_item_private_key(item: &mut serde_json::Value) {
+    if let Some(key) = item
+        .get_mut("sshKey")
+        .and_then(|v| v.get_mut("privateKey"))
+    {
+        if let serde_json::Value::String(s) = key {
+            s.zeroize();
+        }
+        *key = serde_json::Value::Null;
+    }
 }
 
 /// Log in (via the configured API key, or a prior `bw login`) and unlock the

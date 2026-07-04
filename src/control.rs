@@ -73,6 +73,11 @@ pub fn resolve_control_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     Ok(PathBuf::from(dir).join(CONTROL_SOCKET_NAME))
 }
 
+/// A connection that sends nothing (or trickles bytes) must not be allowed to
+/// pin a task/fd/buffer forever — this is the ceiling for an entire request
+/// (read command byte, read any body, run the operation, write the response).
+const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Daemon side: accept control connections forever, unlocking the vault via
 /// `unlock` on request. One connection = one unlock attempt.
 pub async fn serve_control(listener: UnixListener, unlock: UnlockManager) {
@@ -86,13 +91,57 @@ pub async fn serve_control(listener: UnixListener, unlock: UnlockManager) {
                 continue;
             }
         };
+
+        // Only the same local user may use this socket — belt-and-braces on
+        // top of the 0600 file mode, in case of a permissions misconfiguration.
+        if let Err(e) = check_peer_is_self(&stream) {
+            log::warn!("rejecting control connection: {e:#}");
+            continue;
+        }
+
         let unlock = unlock.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_control_connection(stream, unlock).await {
-                log::warn!("control connection error: {e:#}");
+            let result = tokio::time::timeout(
+                CONNECTION_TIMEOUT,
+                handle_control_connection(stream, unlock),
+            )
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log::warn!("control connection error: {e:#}"),
+                Err(_) => log::warn!(
+                    "control connection timed out after {CONNECTION_TIMEOUT:?} \
+                     (client sent no/partial data); dropped"
+                ),
             }
         });
     }
+}
+
+/// Reject a connection from any UID other than our own, on top of the socket's
+/// 0600 mode — defense in depth against a permissions misconfiguration (e.g. a
+/// misconfigured `$XDG_RUNTIME_DIR` shared across users).
+#[cfg(unix)]
+fn check_peer_is_self(stream: &UnixStream) -> Result<()> {
+    let peer_uid = stream
+        .peer_cred()
+        .context("reading control socket peer credentials")?
+        .uid();
+    let our_uid = current_uid();
+    if peer_uid != our_uid {
+        bail!("peer uid {peer_uid} does not match our own uid {our_uid}");
+    }
+    Ok(())
+}
+
+/// Minimal FFI to libc `getuid`, matching the existing `umask` FFI pattern in
+/// `main.rs` rather than pulling in the whole `libc` crate for one call.
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    unsafe { getuid() }
 }
 
 /// Handle a single control connection: dispatch on the leading command byte,
