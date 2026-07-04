@@ -279,11 +279,16 @@ impl Drop for SshKeyPayload {
 /// What the wizard decided to do with a single selected candidate.
 enum KeyPlan {
     /// Create a brand-new vault item.
-    Create { name: String, payload: SshKeyPayload },
+    Create {
+        name: String,
+        notes: Option<String>,
+        payload: SshKeyPayload,
+    },
     /// Overwrite an existing vault item (fingerprint already present).
     Overwrite {
         id: String,
         name: String,
+        notes: Option<String>,
         payload: SshKeyPayload,
     },
     /// Skip this key, recording why for the closing summary.
@@ -532,8 +537,14 @@ fn decide_for_key(candidate: &Candidate, existing: Option<&VaultKeyRef>) -> Resu
         candidate.private_pem.clone()
     };
 
-    // 3. Confirm the item name.
+    // 3. Confirm the item name and optionally add a note (e.g. what this key is
+    //    for). Left blank, the item's notes are cleared rather than left as
+    //    whatever placeholder text `bw get template item` happens to ship
+    //    (e.g. "Some notes about this item.") — that text is template filler,
+    //    not something that should end up on a real vault item.
     let name = prompt_text("Vault item name:", &default_name)?;
+    let notes = prompt_text("Notes (optional, e.g. what this key is for):", "")?;
+    let notes = (!notes.is_empty()).then_some(notes);
 
     let payload = SshKeyPayload {
         private_key,
@@ -542,8 +553,17 @@ fn decide_for_key(candidate: &Candidate, existing: Option<&VaultKeyRef>) -> Resu
     };
 
     Ok(match overwrite_id {
-        Some(id) => KeyPlan::Overwrite { id, name, payload },
-        None => KeyPlan::Create { name, payload },
+        Some(id) => KeyPlan::Overwrite {
+            id,
+            name,
+            notes,
+            payload,
+        },
+        None => KeyPlan::Create {
+            name,
+            notes,
+            payload,
+        },
     })
 }
 
@@ -608,14 +628,14 @@ async fn execute_plans(
     println!("\n{}", separator());
     for plan in &plans {
         match plan {
-            KeyPlan::Create { name, payload } => {
+            KeyPlan::Create { name, notes, payload } => {
                 if dry_run {
                     println!("would create:    {name}");
                     created.push(name.clone());
                     continue;
                 }
                 let base = template.clone().expect("template fetched when creating");
-                let item = build_item_value(base, name, payload);
+                let item = build_item_value(base, name, notes.as_deref(), payload);
                 match with_spinner(
                     &format!("Creating vault item \"{name}\"..."),
                     cli.create_item(session, &item),
@@ -632,7 +652,7 @@ async fn execute_plans(
                     }
                 }
             }
-            KeyPlan::Overwrite { id, name, payload } => {
+            KeyPlan::Overwrite { id, name, notes, payload } => {
                 if dry_run {
                     println!("would overwrite: {name}  (id {id})");
                     overwritten.push(name.clone());
@@ -640,7 +660,7 @@ async fn execute_plans(
                 }
                 match with_spinner(
                     &format!("Overwriting vault item \"{name}\"..."),
-                    overwrite_item(cli, session, id, name, payload),
+                    overwrite_item(cli, session, id, name, notes.as_deref(), payload),
                 )
                 .await
                 {
@@ -686,20 +706,30 @@ async fn overwrite_item(
     session: &Session,
     id: &str,
     name: &str,
+    notes: Option<&str>,
     payload: &SshKeyPayload,
 ) -> Result<()> {
     let existing = cli
         .get_item(session, id)
         .await
         .context("fetching the existing vault item to overwrite")?;
-    let item = build_item_value(existing, name, payload);
+    // Leaving the notes prompt blank on an overwrite means "keep whatever note
+    // is already there", not "clear it" — only override if the user typed one.
+    let kept_notes = existing.get("notes").and_then(|v| v.as_str()).map(str::to_string);
+    let notes = notes.map(str::to_string).or(kept_notes);
+    let item = build_item_value(existing, name, notes.as_deref(), payload);
     cli.edit_item(session, id, &item).await?;
     Ok(())
 }
 
 /// Merge an SSH Key payload into a base object (an item template for a new item,
 /// or the existing item for an overwrite), producing a valid type-5 item.
-fn build_item_value(base: serde_json::Value, name: &str, payload: &SshKeyPayload) -> serde_json::Value {
+fn build_item_value(
+    base: serde_json::Value,
+    name: &str,
+    notes: Option<&str>,
+    payload: &SshKeyPayload,
+) -> serde_json::Value {
     use serde_json::{json, Map, Value};
 
     let mut map = match base {
@@ -708,6 +738,9 @@ fn build_item_value(base: serde_json::Value, name: &str, payload: &SshKeyPayload
     };
     map.insert("type".to_string(), json!(5));
     map.insert("name".to_string(), json!(name));
+    // Always set explicitly (never left as the template's placeholder text,
+    // e.g. "Some notes about this item.") — `None` clears it to `null`.
+    map.insert("notes".to_string(), json!(notes));
     map.insert(
         "sshKey".to_string(),
         json!({
@@ -1008,7 +1041,7 @@ mod tests {
         let template = serde_json::json!({
             "type": 1,
             "name": "",
-            "notes": null,
+            "notes": "Some notes about this item.",
             "favorite": false,
             "login": { "username": "leftover" },
             "sshKey": null,
@@ -1018,10 +1051,14 @@ mod tests {
             public_key: "ssh-ed25519 AAAA comment".to_string(),
             fingerprint: "SHA256:abc".to_string(),
         };
-        let item = build_item_value(template, "my key", &payload);
+        let item = build_item_value(template, "my key", None, &payload);
 
         assert_eq!(item["type"], serde_json::json!(5));
         assert_eq!(item["name"], serde_json::json!("my key"));
+        // The template's placeholder notes text must never survive into a real
+        // item — `None` clears it rather than leaving "Some notes about this
+        // item." sitting in the vault.
+        assert_eq!(item["notes"], serde_json::Value::Null);
         assert_eq!(item["sshKey"]["privateKey"], serde_json::json!("PRIV"));
         assert_eq!(
             item["sshKey"]["publicKey"],
@@ -1031,6 +1068,24 @@ mod tests {
         // Preserved unrelated field, cleared the stale login payload.
         assert_eq!(item["favorite"], serde_json::json!(false));
         assert_eq!(item["login"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn build_item_value_carries_through_custom_notes() {
+        let template = serde_json::json!({
+            "type": 1,
+            "name": "",
+            "notes": "Some notes about this item.",
+            "favorite": false,
+            "sshKey": null,
+        });
+        let payload = SshKeyPayload {
+            private_key: "PRIV".to_string(),
+            public_key: "ssh-ed25519 AAAA comment".to_string(),
+            fingerprint: "SHA256:abc".to_string(),
+        };
+        let item = build_item_value(template, "my key", Some("used for prod servers"), &payload);
+        assert_eq!(item["notes"], serde_json::json!("used for prod servers"));
     }
 
     #[test]

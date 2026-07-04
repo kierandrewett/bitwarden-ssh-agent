@@ -132,10 +132,53 @@ impl UnlockManager {
         };
 
         log::info!("refreshing vault: re-syncing and reloading SSH keys");
-        let keys = self.load_keys(&session).await?;
-        let count = keys.len();
-        *state = State::Unlocked { session, keys };
-        Ok(RefreshOutcome::Refreshed(count))
+        match self.load_keys(&session).await {
+            Ok(keys) => {
+                let count = keys.len();
+                *state = State::Unlocked { session, keys };
+                Ok(RefreshOutcome::Refreshed(count))
+            }
+            Err(e) => {
+                // `bw` has a known quirk (and, on some setups, an actual vault
+                // timeout policy) where a previously-valid session starts being
+                // rejected by commands like `list items` after a while, even
+                // though sync and other calls with the same session still work.
+                // If a systemd credential is provisioned, silently re-derive a
+                // fresh session from it rather than surfacing a cryptic "Vault
+                // is locked" — this is exactly the auto-unlock path already used
+                // at startup, just triggered here instead of on boot.
+                log::warn!(
+                    "refresh with the existing session failed ({e:#}); trying the \
+                     systemd credential for a silent re-unlock before giving up"
+                );
+                match read_master_password_credential() {
+                    Ok(Some(password)) => match self.unlock_and_load(&password).await {
+                        Ok((session, keys)) => {
+                            let count = keys.len();
+                            log::info!(
+                                "silently re-unlocked via systemd credential; now serving \
+                                 {count} SSH key(s)"
+                            );
+                            *state = State::Unlocked { session, keys };
+                            Ok(RefreshOutcome::Refreshed(count))
+                        }
+                        Err(_) => {
+                            // Leave `state` untouched: the stale session's already-cached
+                            // keys still work fine for signing, only the refresh failed.
+                            Err(e).context(
+                                "listing SSH keys from vault (re-unlock via systemd \
+                                 credential also failed; existing cached keys are still \
+                                 served, but run `bitwarden-ssh-agent unlock` to refresh)",
+                            )
+                        }
+                    },
+                    _ => Err(e).context(
+                        "listing SSH keys from vault (no systemd credential to silently \
+                         retry with; run `bitwarden-ssh-agent unlock` to refresh)",
+                    ),
+                }
+            }
+        }
     }
 
     /// At startup, try to unlock non-interactively using a systemd credential.
