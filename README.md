@@ -220,8 +220,10 @@ bitwarden-ssh-agent serve [--socket <PATH>] [--config <PATH>]
 
 `setup` runs the interactive one-command configuration flow (see
 [Quick start](#quick-start-bitwarden-ssh-agent-setup-recommended)). `serve` runs
-the daemon and is the default subcommand: `--socket` overrides the socket path
-and `--config` overrides the config file location. Run `--help` for details.
+the daemon: `--socket` overrides the socket path and `--config` overrides the
+config file location. A subcommand is required — running the bare command with
+no subcommand prints help and exits without starting the daemon. Run `--help`
+for details.
 
 ## Troubleshooting
 

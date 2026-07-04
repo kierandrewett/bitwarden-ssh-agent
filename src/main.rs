@@ -32,16 +32,19 @@ const SOCKET_NAME: &str = "bitwarden-ssh-agent.sock";
     about = "A headless SSH agent daemon backed by your Bitwarden vault",
     long_about = "Serves the SSH agent protocol on a Unix socket. SSH private keys are \
 fetched from your Bitwarden vault via the `bw` CLI and held only in memory; \
-signing happens in-process, so agent-forwarding works like a normal ssh-agent."
+signing happens in-process, so agent-forwarding works like a normal ssh-agent.",
+    // No default subcommand: running bare prints help and exits cleanly rather
+    // than silently starting the daemon.
+    arg_required_else_help = true
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the agent daemon (this is what systemd runs). Also the default.
+    /// Run the agent daemon (this is what systemd runs).
     Serve(ServeArgs),
 
     /// Interactively configure everything: `bw` CLI, API key, config file,
@@ -80,9 +83,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Serve(args)) => serve(args).await,
-        Some(Command::Setup(args)) => setup::run(args.config).await,
-        None => serve(ServeArgs { socket: None, config: None }).await,
+        Command::Serve(args) => serve(args).await,
+        Command::Setup(args) => setup::run(args.config).await,
     }
 }
 
