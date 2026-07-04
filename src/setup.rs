@@ -264,17 +264,21 @@ async fn provision_master_password(
     step(4, "Master password unlock");
     println!("The master password is what actually unlocks your vault. It is");
     println!("never stored in plaintext.\n");
-    println!("Whatever you choose here, the daemon ALWAYS falls back to prompting");
-    println!("you for the master password via systemd-ask-password whenever it");
-    println!("starts without a valid credential to unlock the vault — that is just");
-    println!("how the daemon behaves, not a separate mode you have to pick.\n");
+    println!("Whenever the daemon starts locked (no credential, or the credential");
+    println!("fails), you unlock it interactively by running:\n");
+    println!("    bitwarden-ssh-agent unlock\n");
+    println!("which prompts for the master password in your own terminal and hands");
+    println!("it to the running daemon — this always works, headless or not.\n");
+    println!("(The daemon also makes a best-effort systemd-ask-password prompt on");
+    println!("first use, but that only succeeds if you separately run an");
+    println!("ask-password agent, so treat `unlock` as the primary path.)\n");
     println!("Optionally, you can also provision an encrypted systemd credential so");
     println!("the vault unlocks automatically at startup with no prompt.\n");
 
     if !prompt_yes_no("Set up auto-unlock at startup? (recommended)", true)? {
-        println!("\nNo credential will be provisioned. The daemon will start locked");
-        println!("and prompt via systemd-ask-password on first use. You can re-run");
-        println!("`setup` later to switch to auto-unlock.");
+        println!("\nNo credential will be provisioned. The daemon will start locked;");
+        println!("unlock it after each boot by running `bitwarden-ssh-agent unlock`.");
+        println!("You can re-run `setup` later to switch to auto-unlock.");
         return Ok(UnlockStrategy::OnDemand);
     }
 
@@ -349,8 +353,13 @@ async fn encrypt_master_password_credential(
             .with_context(|| format!("creating credential directory {}", parent.display()))?;
     }
 
+    // `--user` encrypts a *user-scoped* credential (implying `--uid=self`), so a
+    // `systemd --user` instance's `LoadCredentialEncrypted=` can decrypt it. The
+    // default is *system*-scoped, tied to the PID1 manager, which a `--user`
+    // service cannot decrypt — that produces the "Scope mismatch" error and the
+    // credential is silently skipped. See systemd-creds(1) `--user`/`--uid=`.
     let mut child = Command::new("systemd-creds")
-        .args(["encrypt", "--name=bw_master_password", "-"])
+        .args(["encrypt", "--user", "--name=bw_master_password", "-"])
         .arg(cred_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -516,6 +525,10 @@ fn print_ssh_auth_sock() {
     }
 
     println!("Then verify with:  ssh-add -l");
+    println!();
+    println!("If the agent has no keys yet, the vault is locked. Unlock it with:");
+    println!("    bitwarden-ssh-agent unlock");
+    println!("(needed after every reboot unless you provisioned auto-unlock above).");
 }
 
 /// A shell-specific hint for setting `SSH_AUTH_SOCK`, derived from `$SHELL`.
@@ -569,9 +582,14 @@ fn shell_rc_hint() -> ShellHint {
 async fn enable_and_start() -> Result<()> {
     step(6, "Enable and start the service");
 
-    with_spinner("Reloading systemd and enabling the service...", async {
+    with_spinner("Reloading systemd and (re)starting the service...", async {
         run_systemctl(&["daemon-reload"]).await?;
-        run_systemctl(&["enable", "--now", UNIT_FILENAME]).await
+        // `enable` (no `--now`) creates the boot symlink; `restart` then always
+        // (re)starts the unit. Using `enable --now` would NOT restart a service
+        // that was already running from a previous `setup` run, silently leaving
+        // it on stale config/credential — so restart unconditionally instead.
+        run_systemctl(&["enable", UNIT_FILENAME]).await?;
+        run_systemctl(&["restart", UNIT_FILENAME]).await
     })
     .await?;
 
