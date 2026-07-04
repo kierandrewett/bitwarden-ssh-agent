@@ -48,6 +48,7 @@ pub async fn run(config_override: Option<PathBuf>) -> Result<()> {
     let strategy = provision_master_password(&config_path, &api_key).await?;
     install_systemd_unit(&config_path, strategy)?;
     enable_and_start().await?;
+    print_ssh_auth_sock();
 
     Ok(())
 }
@@ -485,6 +486,50 @@ fn render_unit(
          WantedBy=default.target\n",
         exe = exe.display(),
     )
+}
+
+// --- step 7: point SSH at the agent ------------------------------------------
+
+/// Print the `SSH_AUTH_SOCK` export line the user must add to their shell rc.
+/// We deliberately do NOT edit their rc file; we just show the exact line.
+fn print_ssh_auth_sock() {
+    step(7, "Point SSH at the agent");
+
+    let (rc_hint, line) = shell_rc_hint();
+
+    println!("Setup is complete and the daemon is running. The final step is");
+    println!("yours: tell SSH to use this agent by adding the line below to");
+    println!("your shell startup file{rc_hint}, then open a new terminal:\n");
+    println!("    {line}\n");
+    println!("Then verify with:  ssh-add -l");
+}
+
+/// Pick a shell rc file and the matching export syntax from `$SHELL`.
+fn shell_rc_hint() -> (String, &'static str) {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let name = std::path::Path::new(&shell)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    match name.as_str() {
+        "zsh" => (
+            " (~/.zshrc)".to_string(),
+            "export SSH_AUTH_SOCK=\"$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock\"",
+        ),
+        "bash" => (
+            " (~/.bashrc)".to_string(),
+            "export SSH_AUTH_SOCK=\"$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock\"",
+        ),
+        "fish" => (
+            " (~/.config/fish/config.fish)".to_string(),
+            "set -gx SSH_AUTH_SOCK \"$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock\"",
+        ),
+        _ => (
+            " (e.g. ~/.bashrc or ~/.zshrc)".to_string(),
+            "export SSH_AUTH_SOCK=\"$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock\"",
+        ),
+    }
 }
 
 // --- step 6: enable and start ------------------------------------------------
