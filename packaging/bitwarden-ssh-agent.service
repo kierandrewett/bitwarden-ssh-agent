@@ -24,8 +24,11 @@ Environment=PATH=%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 # password supplied as a systemd credential. The daemon reads it from
 # $CREDENTIALS_DIRECTORY/bw_master_password.
 #
-# Encrypt it once (stores an opaque blob, not the plaintext):
-#   systemd-creds encrypt --name=bw_master_password - \
+# Encrypt it once (stores an opaque blob, not the plaintext). The --user flag
+# is REQUIRED: it encrypts a user-scoped credential that a `systemd --user`
+# service can decrypt. Without it the blob is system-scoped and decryption
+# fails at startup with "Scope mismatch", so the credential is skipped.
+#   systemd-creds encrypt --user --name=bw_master_password - \
 #       %h/.config/bitwarden-ssh-agent/bw_master_password.cred
 #   (type the password, then Ctrl-D)
 # Then enable it here:
@@ -34,8 +37,11 @@ Environment=PATH=%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 # Or, less securely, from a plaintext file that is chmod 600:
 # LoadCredential=bw_master_password:%h/.config/bitwarden-ssh-agent/bw_master_password
 #
-# If you provision NEITHER, the daemon still starts (locked) and prompts for
-# the master password via systemd-ask-password on the first SSH request.
+# If you provision NEITHER, the daemon still starts (locked). Unlock it
+# interactively at any time with `bitwarden-ssh-agent unlock`, which prompts in
+# your terminal and hands the password to the daemon over its control socket.
+# (It also makes a best-effort systemd-ask-password prompt on first use, but
+# that only works if you separately run an ask-password agent.)
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

@@ -100,11 +100,11 @@ anything, so it is safe to re-run):
 4. **Sets up master-password unlock** — asks a single yes/no: set up
    auto-unlock at startup? If yes, it provisions an encrypted systemd
    credential (prompting for the password with masked input, verifying it
-   unlocks the vault, then piping it straight into `systemd-creds encrypt`; the
-   plaintext never touches disk or your shell history). Either way, the daemon
-   *always* falls back to prompting via `systemd-ask-password` whenever it
-   starts without a valid credential — that's inherent daemon behavior, not a
-   separate mode you choose.
+   unlocks the vault, then piping it straight into `systemd-creds encrypt
+   --user`; the plaintext never touches disk or your shell history). Either
+   way, whenever the daemon starts locked you can unlock it interactively with
+   `bitwarden-ssh-agent unlock`, which prompts in your own terminal and hands
+   the password to the running daemon — the reliable, headless-friendly path.
 5. **Installs the `systemd --user` unit** with `ExecStart=` pointing at the
    binary you just built.
 6. **Enables and starts** the service and checks it came up.
@@ -146,15 +146,32 @@ journalctl --user -u bitwarden-ssh-agent.service -f
 
 ### Supplying the master password
 
-There are two ways; pick one.
+The vault can only be unlocked with your master password. You provision it one
+of two ways below. Whichever you pick, whenever the daemon is running but
+**locked** — no credential, or the credential failed — unlock it interactively:
+
+```sh
+bitwarden-ssh-agent unlock
+```
+
+This prompts (masked) for your master password in your **own terminal** and
+hands it to the running daemon over a local control socket
+(`$XDG_RUNTIME_DIR/bitwarden-ssh-agent.ctl`, `0600`). It always works, headless
+or not, and reports clearly on success or a wrong password. It reuses the same
+single-flight unlock state as the daemon, so it is safe to run even while a
+first SSH request is racing to unlock. This is the reliable interactive path;
+use it after a reboot if you did not provision auto-unlock.
 
 #### A) Auto-unlock at startup with a systemd credential (recommended)
 
 Encrypt the master password once (systemd stores an opaque, host-bound blob —
-not the plaintext):
+not the plaintext). The `--user` flag is **required**: it produces a
+*user-scoped* credential that a `systemd --user` service can decrypt. Without
+it the blob is *system*-scoped and the daemon fails to decrypt it at startup
+with `Scope mismatch`, silently skipping it (so the vault stays locked):
 
 ```sh
-systemd-creds encrypt --name=bw_master_password - \
+systemd-creds encrypt --user --name=bw_master_password - \
     ~/.config/bitwarden-ssh-agent/bw_master_password.cred
 # type your master password, then press Ctrl-D
 chmod 600 ~/.config/bitwarden-ssh-agent/bw_master_password.cred
@@ -169,14 +186,20 @@ LoadCredentialEncrypted=bw_master_password:%h/.config/bitwarden-ssh-agent/bw_mas
 The daemon reads it from `$CREDENTIALS_DIRECTORY/bw_master_password` and unlocks
 the vault immediately at startup.
 
-#### B) On-demand prompt (no credential provisioned)
+#### B) No credential provisioned (unlock on demand)
 
 If you provision no credential, the daemon still starts — in a **locked** state.
-The **first** time an SSH client actually uses the agent, it prompts for the
-master password via `systemd-ask-password` (which handles TTY / SSH askpass /
-plymouth). It unlocks, caches your keys, and completes the request. If several
-SSH connections race in during the locked window, only **one** prompt fires and
-the rest wait on it.
+Run `bitwarden-ssh-agent unlock` (above) to unlock it; this is the reliable
+path and is what you should use after a reboot.
+
+As a bonus, the **first** time an SSH client uses the agent while locked, the
+daemon also makes a best-effort `systemd-ask-password` prompt. This only
+succeeds if some ask-password *agent* is watching the queue (e.g. you run
+`systemd-tty-ask-password-agent --watch`, or a plymouth/GUI frontend). On a
+typical headless `systemd --user` service nothing is, so that prompt fails fast
+(short timeout) rather than hanging — fall back to `unlock`. Either way, if
+several SSH connections race in during the locked window, only **one** unlock
+runs and the rest wait on it.
 
 Once unlocked (either way), the daemon stays unlocked in memory for its
 lifetime — this is a personal single-user machine daemon, so there is no re-lock
