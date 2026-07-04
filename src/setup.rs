@@ -8,7 +8,6 @@
 //! Every destructive step (overwriting the config, the unit file, or an existing
 //! credential) prompts first, so re-running `setup` is safe and idempotent.
 
-use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -20,6 +19,7 @@ use zeroize::Zeroize;
 
 use crate::bitwarden::BitwardenCli;
 use crate::config::{self, ApiKey};
+use crate::ui::{done_banner, ok_mark, step_banner, with_spinner};
 
 /// Bitwarden API key collected (and validated) during setup.
 struct ApiKeyInput {
@@ -693,56 +693,9 @@ async fn program_runs(program: &str, args: &[&str]) -> bool {
 const TOTAL_STEPS: u8 = 6;
 
 /// Print a colored, progress-numbered step banner so the user can follow along.
+/// Thin wrapper over [`crate::ui::step_banner`] that fills in setup's step total.
 fn step(n: u8, title: &str) {
-    println!();
-    println!("{}", bold_cyan(&format!("Step {n}/{TOTAL_STEPS}: {title}")));
-}
-
-/// Print the final completion banner (unnumbered; setup's work is already done).
-fn done_banner(title: &str) {
-    println!();
-    println!("{}", bold_cyan(&format!("Done: {title}")));
-}
-
-/// Whether stdout is a terminal, so ANSI color is worth emitting.
-fn color_enabled() -> bool {
-    std::io::stdout().is_terminal()
-}
-
-/// Wrap `s` in bold cyan when writing to a terminal, else return it plain.
-fn bold_cyan(s: &str) -> String {
-    if color_enabled() {
-        format!("\x1b[1;36m{s}\x1b[0m")
-    } else {
-        s.to_string()
-    }
-}
-
-/// A green check mark (plain "OK" markers stay legible when piped).
-fn ok_mark() -> &'static str {
-    if color_enabled() {
-        "\x1b[32m✓\x1b[0m"
-    } else {
-        "✓"
-    }
-}
-
-/// Run an async operation while showing a steady spinner, clearing it on
-/// completion so the caller can print its own success/failure line. The spinner
-/// hides itself automatically when stdout/stderr is not a terminal.
-async fn with_spinner<F, T>(message: &str, fut: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    let pb = indicatif::ProgressBar::new_spinner();
-    if let Ok(style) = indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}") {
-        pb.set_style(style);
-    }
-    pb.set_message(message.to_string());
-    pb.enable_steady_tick(std::time::Duration::from_millis(90));
-    let out = fut.await;
-    pb.finish_and_clear();
-    out
+    step_banner(n, TOTAL_STEPS, title);
 }
 
 /// Prompt for a free-form line of text. With a default, an empty submission

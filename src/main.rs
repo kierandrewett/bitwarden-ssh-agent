@@ -11,6 +11,7 @@ mod config;
 mod control;
 mod import;
 mod setup;
+mod ui;
 mod unlock;
 
 use std::path::PathBuf;
