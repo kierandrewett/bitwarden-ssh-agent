@@ -109,15 +109,19 @@ async fn main() -> Result<()> {
 async fn unlock_cli(args: UnlockArgs) -> Result<()> {
     let control_path = control::resolve_control_path(args.control_socket)?;
 
-    let password = inquire::Password::new("Bitwarden master password:")
-        .with_display_mode(inquire::PasswordDisplayMode::Masked)
-        .without_confirmation()
-        .with_help_message("Sent directly to the running daemon; never stored or echoed.")
-        .prompt()
-        .map_err(|e| anyhow::anyhow!("failed to read password: {e}"))?;
-    let password = secrecy::SecretString::from(password);
+    // Connect first (inside run_unlock_client); only prompt once the daemon is
+    // known reachable, so a stopped daemon fails fast without asking for input.
+    let prompt = || {
+        let password = inquire::Password::new("Bitwarden master password:")
+            .with_display_mode(inquire::PasswordDisplayMode::Masked)
+            .without_confirmation()
+            .with_help_message("Sent directly to the running daemon; never stored or echoed.")
+            .prompt()
+            .map_err(|e| anyhow::anyhow!("failed to read password: {e}"))?;
+        Ok(secrecy::SecretString::from(password))
+    };
 
-    let code = control::run_unlock_client(&control_path, password).await?;
+    let code = control::run_unlock_client(&control_path, prompt).await?;
     std::process::exit(code);
 }
 

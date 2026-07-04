@@ -164,9 +164,14 @@ async fn write_response(stream: &mut UnixStream, status: u8, message: &str) -> R
     Ok(())
 }
 
-/// Client side: connect to the control socket, send `password`, print the
-/// daemon's response. Returns the process exit code to use.
-pub async fn run_unlock_client(control_path: &Path, password: SecretString) -> Result<i32> {
+/// Client side: connect to the control socket first (fail fast with a clear
+/// message if the daemon isn't running — no point prompting for a password we
+/// can't deliver), then obtain the password via `prompt`, send it, and print
+/// the daemon's response. Returns the process exit code to use.
+pub async fn run_unlock_client(
+    control_path: &Path,
+    prompt: impl FnOnce() -> Result<SecretString>,
+) -> Result<i32> {
     let mut stream = UnixStream::connect(control_path).await.map_err(|e| {
         anyhow::anyhow!(
             "could not connect to the daemon control socket at {} ({e}).\n\
@@ -175,6 +180,9 @@ pub async fn run_unlock_client(control_path: &Path, password: SecretString) -> R
             control_path.display()
         )
     })?;
+
+    // Daemon is reachable: now prompt for the password.
+    let password = prompt()?;
 
     // Send the length-prefixed password, then scrub our copy.
     let mut body = password.expose_secret().as_bytes().to_vec();
