@@ -1,0 +1,9 @@
+[package]
+name = "bitwarden-ssh-agent"
+version = "0.1.0"
+edition = "2021"
+description = "A headless SSH agent daemon backed by a Bitwarden vault"
+repository = "https://github.com/kierandrewett/bitwarden-ssh-agent"
+readme = "README.md"
+
+[dependencies]

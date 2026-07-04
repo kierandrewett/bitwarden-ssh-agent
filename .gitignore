@@ -1,0 +1,12 @@
+/target
+
+# Editor / OS cruft
+*.swp
+*.swo
+.DS_Store
+/.idea/
+/.vscode/
+
+# Local secrets — never commit these
+/config.toml
+*.cred
