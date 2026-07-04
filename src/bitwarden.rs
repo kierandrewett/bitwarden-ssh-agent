@@ -172,6 +172,23 @@ impl BitwardenCli {
         Ok(())
     }
 
+    /// Log the device out, if it is logged in. Used by `setup` to force a
+    /// clean `bw login --apikey` so freshly-entered credentials are actually
+    /// validated rather than silently accepted because a prior session existed.
+    pub async fn logout(&self) -> Result<()> {
+        let out = self
+            .base_command()
+            .arg("logout")
+            .output()
+            .await
+            .context("running `bw logout`")?;
+        // `bw logout` exits non-zero if already logged out; that's fine.
+        if !out.status.success() {
+            log::debug!("`bw logout` returned non-zero (likely already logged out)");
+        }
+        Ok(())
+    }
+
     /// Unlock the vault with the master password and return a session key.
     ///
     /// The password is written to the subprocess environment under a private

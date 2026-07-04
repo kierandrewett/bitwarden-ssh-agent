@@ -13,9 +13,18 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
+use secrecy::{ExposeSecret, SecretString};
 use tokio::process::Command;
 
 use crate::bitwarden::BitwardenCli;
+use crate::config::ApiKey;
+
+/// Bitwarden API key collected (and validated) during setup.
+struct ApiKeyInput {
+    client_id: String,
+    client_secret: SecretString,
+    server: Option<String>,
+}
 
 /// Entry point for `bitwarden-ssh-agent setup`.
 pub async fn run(config_override: Option<PathBuf>) -> Result<()> {
@@ -27,6 +36,7 @@ pub async fn run(config_override: Option<PathBuf>) -> Result<()> {
     println!("safe to re-run.\n");
 
     ensure_bw_cli().await?;
+    let _api_key = collect_and_validate_api_key().await?;
 
     Ok(())
 }
@@ -93,6 +103,63 @@ async fn ensure_bw_cli() -> Result<()> {
              or set BW_CLI_PATH, then re-run `setup`."
         ),
     }
+}
+
+// --- step 2: API key ---------------------------------------------------------
+
+/// Prompt for the Bitwarden API key (and optional self-hosted server), then
+/// validate it by actually attempting `bw login --apikey`. Loops on failure so
+/// the user can retry or abort.
+async fn collect_and_validate_api_key() -> Result<ApiKeyInput> {
+    step(2, "Bitwarden API key");
+    println!("Find this in the web vault under");
+    println!("  Account settings -> Security -> Keys -> API key -> View API Key.");
+    println!("(This only authenticates the device; it cannot unlock the vault.)\n");
+
+    loop {
+        let client_id = prompt("client_id (starts with `user.`)", None)?;
+        let client_secret = SecretString::from(prompt("client_secret", None)?);
+        println!("\nSelf-hosted Bitwarden/Vaultwarden only. Leave blank for the");
+        println!("official Bitwarden cloud (bitwarden.com).");
+        let server_raw = prompt("server URL (optional)", Some(""))?;
+        let server = if server_raw.is_empty() {
+            None
+        } else {
+            Some(server_raw)
+        };
+
+        let api_key = ApiKey {
+            client_id: client_id.clone(),
+            client_secret: client_secret.clone(),
+        };
+
+        println!("\nValidating with `bw login --apikey`...");
+        match validate_api_key(&api_key, server.as_deref()).await {
+            Ok(()) => {
+                println!("API key accepted; device is now logged in to Bitwarden.");
+                return Ok(ApiKeyInput {
+                    client_id,
+                    client_secret,
+                    server,
+                });
+            }
+            Err(e) => {
+                println!("\nLogin failed:\n{e:#}\n");
+                if !prompt_yes_no("Try again with different credentials?", true)? {
+                    anyhow::bail!("aborted: API key not validated");
+                }
+            }
+        }
+    }
+}
+
+/// Force a clean `bw login --apikey` with the given credentials so they are
+/// genuinely validated (logging out first if a prior session exists).
+async fn validate_api_key(api_key: &ApiKey, server: Option<&str>) -> Result<()> {
+    let cli = BitwardenCli::new(server.map(str::to_string));
+    // Log out any existing session so login actually exercises these creds.
+    cli.logout().await?;
+    cli.login_with_api_key(api_key).await
 }
 
 /// Return true if `<program> <args...>` runs and exits successfully.
