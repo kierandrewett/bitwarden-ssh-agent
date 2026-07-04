@@ -149,13 +149,19 @@ impl BitwardenCli {
     /// Ensure the device is logged in via the API key. No-op if already logged
     /// in. The API secret is passed through the subprocess env only.
     pub async fn login_with_api_key(&self, api_key: &ApiKey) -> Result<()> {
-        self.configure_server().await?;
-
+        // Short-circuit before touching the server config: `bw config server`
+        // is rejected while the device is logged in ("Logout required before
+        // server config update"), so running it unconditionally broke every
+        // unlock on an already-logged-in self-hosted device.
         let status = self.status().await?;
         if status.is_logged_in() {
             log::debug!("bw already logged in (status: {})", status.status);
             return Ok(());
         }
+
+        // Only now (logged out) is it valid to point the CLI at a self-hosted
+        // server, which must happen before `bw login`.
+        self.configure_server().await?;
 
         log::info!("logging in to Bitwarden with API key");
         let out = self
