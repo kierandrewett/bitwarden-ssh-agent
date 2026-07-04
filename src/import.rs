@@ -12,11 +12,13 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use ssh_key::{HashAlg, PrivateKey, PublicKey};
+use anyhow::{anyhow, Context, Result};
+use secrecy::SecretString;
+use ssh_key::{HashAlg, LineEnding, PrivateKey, PublicKey};
 use zeroize::Zeroize;
 
-use crate::bitwarden::SshKeyItem;
+use crate::bitwarden::{BitwardenCli, Session, SshKeyItem};
+use crate::config::Config;
 
 /// A private key file discovered in the SSH directory, with everything the
 /// wizard needs to display it and (later) import it.
@@ -238,44 +240,409 @@ fn resolve_ssh_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".ssh"))
 }
 
+/// The `sshKey` payload for a vault SSH Key item. `private_key` is sensitive and
+/// is zeroized once the item has been created.
+struct SshKeyPayload {
+    private_key: String,
+    public_key: String,
+    fingerprint: String,
+}
+
+impl Drop for SshKeyPayload {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+    }
+}
+
+/// What the wizard decided to do with a single selected candidate.
+enum KeyPlan {
+    /// Create a brand-new vault item.
+    Create { name: String, payload: SshKeyPayload },
+    /// Overwrite an existing vault item (fingerprint already present).
+    Overwrite {
+        id: String,
+        name: String,
+        payload: SshKeyPayload,
+    },
+    /// Skip this key, recording why for the closing summary.
+    Skip { name: String, reason: String },
+}
+
 /// Entry point for `bitwarden-ssh-agent import`.
 pub async fn run(
     ssh_dir: Option<PathBuf>,
     config: Option<PathBuf>,
     dry_run: bool,
 ) -> Result<()> {
-    let _ = (config, dry_run);
     println!("bitwarden-ssh-agent import");
     println!("==========================\n");
+    if dry_run {
+        println!("(dry run: no vault items will be created or modified)\n");
+    }
 
     let dir = resolve_ssh_dir(ssh_dir)?;
     println!("Scanning {} for SSH private keys...", dir.display());
-    let candidates = scan_dir(&dir)?;
+    let mut candidates = scan_dir(&dir)?;
 
     if candidates.is_empty() {
         println!("No SSH private keys found in {}.", dir.display());
         return Ok(());
     }
+    println!("Found {} candidate key(s).\n", candidates.len());
 
-    println!("Found {} candidate key(s):", candidates.len());
-    for c in &candidates {
-        println!(
-            "  {}  [{}]  {}  {}{}",
-            c.path.display(),
-            c.algo_label(),
-            c.fingerprint,
-            c.comment,
-            if c.encrypted { "  (passphrase-protected)" } else { "" },
-        );
-    }
+    // Unlock our own `bw` session (independent of the running daemon) and read
+    // the SSH Key items already in the vault, so duplicates can be flagged.
+    let (cli, session) = open_vault_session(config).await?;
+    let existing = cli
+        .list_ssh_keys(&session)
+        .await
+        .context("listing existing SSH Key items from the vault")?;
+    let vault_index = index_vault_keys(&existing);
+    println!(
+        "Vault currently holds {} SSH Key item(s).\n",
+        vault_index.len()
+    );
 
-    // Scrub the raw private-key material we read off disk.
-    let mut candidates = candidates;
+    // Let the user pick which keys to import, then decide per-key what to do.
+    let result = run_wizard(&mut candidates, &vault_index, &cli, &session, dry_run).await;
+
+    // Scrub the raw private-key material we read off disk regardless of outcome.
     for c in &mut candidates {
         c.private_pem.zeroize();
     }
+    result
+}
 
-    anyhow::bail!("wizard not yet implemented")
+/// Run the selection + per-key decisions + execution + summary.
+async fn run_wizard(
+    candidates: &mut [Candidate],
+    vault_index: &[VaultKeyRef],
+    cli: &BitwardenCli,
+    session: &Session,
+    dry_run: bool,
+) -> Result<()> {
+    // Precompute, for each candidate, whether it is already in the vault.
+    let matches: Vec<Option<&VaultKeyRef>> = candidates
+        .iter()
+        .map(|c| find_vault_match(vault_index, &c.fingerprint))
+        .collect();
+
+    // Build the MultiSelect list. Default-select keys that are neither already
+    // in the vault nor passphrase-protected (the safe, ready-to-use ones).
+    let labels: Vec<String> = candidates
+        .iter()
+        .zip(&matches)
+        .map(|(c, m)| candidate_label(c, *m))
+        .collect();
+    let defaults: Vec<usize> = candidates
+        .iter()
+        .zip(&matches)
+        .enumerate()
+        .filter(|(_, (c, m))| m.is_none() && !c.encrypted)
+        .map(|(i, _)| i)
+        .collect();
+
+    let chosen = inquire::MultiSelect::new(
+        "Select the keys to import (space toggles, enter confirms):",
+        labels,
+    )
+    .with_default(&defaults)
+    .with_help_message(
+        "Pre-selected: keys not already in your vault and not passphrase-protected.",
+    )
+    .raw_prompt()
+    .map_err(map_inquire_err)?;
+    let selected_indices: Vec<usize> = chosen.iter().map(|o| o.index).collect();
+
+    if selected_indices.is_empty() {
+        println!("\nNothing selected; nothing to do.");
+        return Ok(());
+    }
+
+    // Decide what to do with each selected key (may prompt for passphrases,
+    // names, and skip/overwrite decisions).
+    let mut plans = Vec::new();
+    for idx in selected_indices {
+        let candidate = &candidates[idx];
+        let existing = matches[idx];
+        plans.push(decide_for_key(candidate, existing)?);
+    }
+
+    execute_plans(plans, cli, session, dry_run).await
+}
+
+/// Interactively decide what to do with one selected candidate.
+fn decide_for_key(candidate: &Candidate, existing: Option<&VaultKeyRef>) -> Result<KeyPlan> {
+    let default_name = default_item_name(candidate);
+    println!("\n{}", separator());
+    println!("Key: {}", candidate.path.display());
+    println!("  type:        {}", candidate.algorithm);
+    println!("  fingerprint: {}", candidate.fingerprint);
+    if !candidate.comment.is_empty() {
+        println!("  comment:     {}", candidate.comment);
+    }
+
+    // 1. If it already exists in the vault, ask skip vs overwrite up front so we
+    //    don't bother prompting for a passphrase on a key we'll skip.
+    let overwrite_id = if let Some(existing) = existing {
+        println!(
+            "  This key is already in your vault as \"{}\".",
+            existing.name
+        );
+        match prompt_choice(
+            "It is already in the vault. What do you want to do?",
+            &[
+                ("skip", "leave the existing item untouched"),
+                ("overwrite", "replace the existing item's key material"),
+            ],
+        )? {
+            "overwrite" => Some(existing.id.clone()),
+            _ => {
+                return Ok(KeyPlan::Skip {
+                    name: existing.name.clone(),
+                    reason: "already in vault (kept existing item)".to_string(),
+                });
+            }
+        }
+    } else {
+        None
+    };
+
+    // 2. Resolve the private-key material, handling passphrase-encrypted keys.
+    let private_key = if candidate.encrypted {
+        println!(
+            "  This key is passphrase-protected. Note: the agent cannot yet sign\n\
+             \x20 with encrypted keys, so an encrypted blob is stored for backup only."
+        );
+        match prompt_choice(
+            "How should this passphrase-protected key be handled?",
+            &[
+                (
+                    "decrypt",
+                    "enter the passphrase; store the DECRYPTED key so the agent can use it",
+                ),
+                (
+                    "encrypted",
+                    "store the encrypted blob as-is (backup only; unusable until decrypted)",
+                ),
+                ("skip", "do not import this key"),
+            ],
+        )? {
+            "decrypt" => decrypt_candidate(candidate)?,
+            "encrypted" => candidate.private_pem.clone(),
+            _ => {
+                return Ok(KeyPlan::Skip {
+                    name: default_name,
+                    reason: "passphrase-protected (skipped by choice)".to_string(),
+                });
+            }
+        }
+    } else {
+        candidate.private_pem.clone()
+    };
+
+    // 3. Confirm the item name.
+    let name = prompt_text("Vault item name:", &default_name)?;
+
+    let payload = SshKeyPayload {
+        private_key,
+        public_key: candidate.public_openssh.clone(),
+        fingerprint: candidate.fingerprint.clone(),
+    };
+
+    Ok(match overwrite_id {
+        Some(id) => KeyPlan::Overwrite { id, name, payload },
+        None => KeyPlan::Create { name, payload },
+    })
+}
+
+/// Decrypt a passphrase-protected candidate in memory, prompting (masked) for
+/// the passphrase, and return the DECRYPTED OpenSSH private-key text. The
+/// passphrase is zeroized on drop; nothing touches disk.
+fn decrypt_candidate(candidate: &Candidate) -> Result<String> {
+    println!(
+        "  (Heads up: the decrypted key is stored unencrypted inside the vault —\n\
+         \x20 the same trust model as every other key already there; Bitwarden's\n\
+         \x20 own encryption is the protection, not the passphrase.)"
+    );
+    let encrypted = PrivateKey::from_openssh(candidate.private_pem.as_bytes())
+        .context("re-parsing the encrypted private key")?;
+
+    loop {
+        let passphrase = SecretString::from(prompt_secret("Passphrase for this key:")?);
+        match encrypted.decrypt(secrecy::ExposeSecret::expose_secret(&passphrase).as_bytes()) {
+            Ok(decrypted) => {
+                let pem = decrypted
+                    .to_openssh(LineEnding::LF)
+                    .context("serializing the decrypted private key")?;
+                return Ok(pem.to_string());
+            }
+            Err(_) => {
+                println!("  Wrong passphrase.");
+                if !prompt_yes_no("Try the passphrase again?", true)? {
+                    anyhow::bail!("aborted: could not decrypt {}", candidate.path.display());
+                }
+            }
+        }
+    }
+}
+
+/// Execute the plans (or, in dry-run mode, describe them), then print a summary.
+async fn execute_plans(
+    plans: Vec<KeyPlan>,
+    cli: &BitwardenCli,
+    session: &Session,
+    dry_run: bool,
+) -> Result<()> {
+    let _ = (cli, session);
+    println!("\n{}", separator());
+    println!("Summary:");
+    // Real creation is wired up in a later step; for now, describe the plan.
+    for plan in &plans {
+        match plan {
+            KeyPlan::Create { name, .. } => {
+                println!("  would create:    {name}");
+            }
+            KeyPlan::Overwrite { name, .. } => {
+                println!("  would overwrite: {name}");
+            }
+            KeyPlan::Skip { name, reason } => {
+                println!("  skipped:         {name} ({reason})");
+            }
+        }
+    }
+    let _ = dry_run;
+    Ok(())
+}
+
+/// Log in (via the configured API key, or a prior `bw login`) and unlock the
+/// vault with a freshly-prompted master password, returning a live session.
+async fn open_vault_session(config: Option<PathBuf>) -> Result<(BitwardenCli, Session)> {
+    let cfg = match &config {
+        Some(path) => Config::load_from(path)?,
+        None => Config::load()?,
+    };
+    let cli = BitwardenCli::new(cfg.server.clone());
+
+    // Ensure the device is logged in.
+    match &cfg.api_key {
+        Some(api_key) => cli
+            .login_with_api_key(api_key)
+            .await
+            .context("logging in to Bitwarden with the configured API key")?,
+        None => {
+            let status = cli.status().await?;
+            if status.status == "unauthenticated" {
+                anyhow::bail!(
+                    "no Bitwarden API key configured and the `bw` CLI is not logged in; \
+                     run `bitwarden-ssh-agent setup` (or `bw login`) first"
+                );
+            }
+        }
+    }
+
+    // Unlock with the master password typed here (masked). Loop on a wrong one.
+    loop {
+        let password = SecretString::from(prompt_secret("Bitwarden master password:")?);
+        match cli.unlock(&password).await {
+            Ok(session) => return Ok((cli, session)),
+            Err(e) => {
+                println!("Unlock failed: {e:#}");
+                if !prompt_yes_no("Try a different master password?", true)? {
+                    anyhow::bail!("aborted: vault not unlocked");
+                }
+            }
+        }
+    }
+}
+
+/// A sensible default vault item name derived from the file name and comment,
+/// e.g. `id_ed25519 (user@host)`.
+fn default_item_name(candidate: &Candidate) -> String {
+    let file = candidate
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "ssh key".to_string());
+    if candidate.comment.is_empty() {
+        file
+    } else {
+        format!("{file} ({})", candidate.comment)
+    }
+}
+
+/// One-line summary of a candidate for the MultiSelect list.
+fn candidate_label(candidate: &Candidate, existing: Option<&VaultKeyRef>) -> String {
+    let name = candidate
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut flags = Vec::new();
+    if candidate.encrypted {
+        flags.push("passphrase-protected".to_string());
+    }
+    if let Some(existing) = existing {
+        flags.push(format!("already in vault as \"{}\"", existing.name));
+    }
+    let suffix = if flags.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", flags.join("; "))
+    };
+    format!(
+        "{name}  ({}, {}){suffix}",
+        candidate.algo_label(),
+        candidate.fingerprint
+    )
+}
+
+fn separator() -> &'static str {
+    "----------------------------------------------------------------"
+}
+
+// --- inquire helpers (mirroring the style used in setup.rs) ------------------
+
+fn prompt_text(question: &str, default: &str) -> Result<String> {
+    inquire::Text::new(question)
+        .with_default(default)
+        .prompt()
+        .map(|s| s.trim().to_string())
+        .map_err(map_inquire_err)
+}
+
+fn prompt_secret(question: &str) -> Result<String> {
+    inquire::Password::new(question)
+        .with_display_mode(inquire::PasswordDisplayMode::Masked)
+        .without_confirmation()
+        .prompt()
+        .map_err(map_inquire_err)
+}
+
+fn prompt_yes_no(question: &str, default_yes: bool) -> Result<bool> {
+    inquire::Confirm::new(question)
+        .with_default(default_yes)
+        .prompt()
+        .map_err(map_inquire_err)
+}
+
+fn prompt_choice<'a>(question: &str, options: &[(&'a str, &str)]) -> Result<&'a str> {
+    let display: Vec<String> = options
+        .iter()
+        .map(|(key, desc)| format!("{key} — {desc}"))
+        .collect();
+    let chosen = inquire::Select::new(question, display)
+        .raw_prompt()
+        .map_err(map_inquire_err)?;
+    Ok(options[chosen.index].0)
+}
+
+fn map_inquire_err(err: inquire::InquireError) -> anyhow::Error {
+    use inquire::InquireError::{OperationCanceled, OperationInterrupted};
+    match err {
+        OperationCanceled | OperationInterrupted => anyhow!("aborted by user"),
+        other => anyhow!(other),
+    }
 }
 
 #[cfg(test)]
