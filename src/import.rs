@@ -19,6 +19,15 @@ use zeroize::Zeroize;
 
 use crate::bitwarden::{BitwardenCli, Session, SshKeyItem};
 use crate::config::Config;
+use crate::ui::{ok_mark, step_banner, with_spinner};
+
+/// Total number of numbered steps in the import wizard.
+const TOTAL_STEPS: u8 = 4;
+
+/// Print a progress-numbered step banner, matching `setup`'s style.
+fn step(n: u8, title: &str) {
+    step_banner(n, TOTAL_STEPS, title);
+}
 
 /// A private key file discovered in the SSH directory, with everything the
 /// wizard needs to display it and (later) import it.
@@ -293,6 +302,8 @@ pub async fn run(
         println!("(dry run: no vault items will be created or modified)\n");
     }
 
+    // --- Step 1: scan for keys ---------------------------------------------
+    step(1, "Scan for SSH keys");
     let dir = resolve_ssh_dir(ssh_dir)?;
     println!("Scanning {} for SSH private keys...", dir.display());
     let mut candidates = scan_dir(&dir)?;
@@ -301,7 +312,7 @@ pub async fn run(
         println!("No SSH private keys found in {}.", dir.display());
         return Ok(());
     }
-    println!("Found {} candidate key(s):\n", candidates.len());
+    println!("{} Found {} candidate key(s):\n", ok_mark(), candidates.len());
     // Show the discovered keys in full *before* asking for the master password,
     // so the user can sanity-check the scan (wrong --ssh-dir, unexpected file)
     // before authenticating to anything. Vault-dedup status isn't known yet, so
@@ -309,18 +320,22 @@ pub async fn run(
     for candidate in candidates.iter() {
         println!("  {}", candidate_label(candidate, None));
     }
-    println!();
 
+    // --- Step 2: unlock the vault ------------------------------------------
+    step(2, "Unlock your Bitwarden vault");
     // Unlock our own `bw` session (independent of the running daemon) and read
     // the SSH Key items already in the vault, so duplicates can be flagged.
     let (cli, session) = open_vault_session(config).await?;
-    let existing = cli
-        .list_ssh_keys(&session)
-        .await
-        .context("listing existing SSH Key items from the vault")?;
+    let existing = with_spinner(
+        "Reading existing SSH Key items from your vault...",
+        cli.list_ssh_keys(&session),
+    )
+    .await
+    .context("listing existing SSH Key items from the vault")?;
     let vault_index = index_vault_keys(&existing);
     println!(
-        "Vault currently holds {} SSH Key item(s).\n",
+        "{} Vault currently holds {} SSH Key item(s).",
+        ok_mark(),
         vault_index.len()
     );
 
@@ -347,6 +362,8 @@ async fn run_wizard(
         .iter()
         .map(|c| find_vault_match(vault_index, &c.fingerprint))
         .collect();
+
+    step(3, "Choose what to import");
 
     // Build the MultiSelect list. Default-select keys that are neither already
     // in the vault nor passphrase-protected (the safe, ready-to-use ones).
@@ -389,6 +406,7 @@ async fn run_wizard(
         plans.push(decide_for_key(candidate, existing)?);
     }
 
+    step(4, "Import");
     let changes = execute_plans(plans, cli, session, dry_run).await?;
 
     // If we actually changed the vault and the daemon is running, offer to nudge
