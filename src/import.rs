@@ -100,10 +100,23 @@ fn scan_dir(dir: &Path) -> Result<Vec<Candidate>> {
     Ok(candidates)
 }
 
+/// OpenSSH private keys are at most a few KB (even a 4096-bit RSA key is under
+/// 4 KB of base64). Anything bigger is definitely not a key, so skip it before
+/// reading — without this, pointing `--ssh-dir` at an arbitrary directory (e.g.
+/// `~/Documents`) would read every large file (videos, PDFs, ...) fully into
+/// memory just to reject it, which can take a very long time.
+const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
+
 /// Try to interpret a single file as an OpenSSH private key. Returns `Ok(None)`
 /// if the file simply is not a private key (so the caller skips it), and only
 /// errors on an unexpected I/O problem worth logging.
 fn analyze_file(path: &Path) -> Result<Option<Candidate>> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > MAX_KEY_FILE_BYTES => return Ok(None),
+        Ok(_) => {}
+        Err(_) => return Ok(None),
+    }
+
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
         // Binary or unreadable file: definitely not an OpenSSH PEM key.
