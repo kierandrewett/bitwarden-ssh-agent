@@ -1,0 +1,55 @@
+[Unit]
+Description=Bitwarden-backed SSH agent
+Documentation=https://github.com/kierandrewett/bitwarden-ssh-agent
+# Start it as part of the normal user session.
+After=default.target
+
+[Service]
+Type=simple
+# Installed via `cargo install --path .` (goes to ~/.cargo/bin).
+# If you installed elsewhere (e.g. /usr/local/bin), adjust this path.
+ExecStart=%h/.cargo/bin/bitwarden-ssh-agent serve
+Restart=on-failure
+RestartSec=2
+
+# The `bw` CLI (and the `node` it needs) must be on PATH. systemd --user
+# services get a minimal PATH, so point it at wherever `npm install -g` put
+# them. Adjust to match your npm global prefix (`npm config get prefix`/bin).
+# Alternatively set BW_CLI_PATH=/full/path/to/bw below.
+Environment=PATH=%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# Environment=BW_CLI_PATH=%h/.npm-global/bin/bw
+
+# ---------------------------------------------------------------------------
+# OPTION A (recommended): unlock automatically at startup with the master
+# password supplied as a systemd credential. The daemon reads it from
+# $CREDENTIALS_DIRECTORY/bw_master_password.
+#
+# Encrypt it once (stores an opaque blob, not the plaintext):
+#   systemd-creds encrypt --name=bw_master_password - \
+#       %h/.config/bitwarden-ssh-agent/bw_master_password.cred
+#   (type the password, then Ctrl-D)
+# Then enable it here:
+# LoadCredentialEncrypted=bw_master_password:%h/.config/bitwarden-ssh-agent/bw_master_password.cred
+#
+# Or, less securely, from a plaintext file that is chmod 600:
+# LoadCredential=bw_master_password:%h/.config/bitwarden-ssh-agent/bw_master_password
+#
+# If you provision NEITHER, the daemon still starts (locked) and prompts for
+# the master password via systemd-ask-password on the first SSH request.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# The Bitwarden API key (device auth) can come from an EnvironmentFile instead
+# of ~/.config/bitwarden-ssh-agent/config.toml. The file must be chmod 600 and
+# contain:
+#   BW_CLIENTID=user.xxxxxxxx-....
+#   BW_CLIENTSECRET=xxxxxxxx
+# EnvironmentFile=%h/.config/bitwarden-ssh-agent/env
+# ---------------------------------------------------------------------------
+
+# Modest hardening. NOTE: do not add ProtectHome — the `bw` CLI needs to read
+# and write its own data under ~/.config.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
