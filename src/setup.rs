@@ -45,8 +45,18 @@ pub async fn run(config_override: Option<PathBuf>) -> Result<()> {
     ensure_bw_cli().await?;
     let api_key = collect_and_validate_api_key().await?;
     write_config(&config_path, &api_key)?;
+    let _strategy = provision_master_password(&config_path, &api_key).await?;
 
     Ok(())
+}
+
+/// Which master-password unlock strategy the user chose.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnlockStrategy {
+    /// Auto-unlock at startup from an encrypted systemd credential.
+    Credential,
+    /// No credential; prompt via systemd-ask-password on first use.
+    OnDemand,
 }
 
 // --- step 1: Bitwarden CLI ---------------------------------------------------
@@ -228,6 +238,161 @@ fn write_config(path: &std::path::Path, api_key: &ApiKeyInput) -> Result<()> {
     contents.zeroize();
 
     println!("Wrote config file with 0600 permissions.");
+    Ok(())
+}
+
+// --- step 4: master password / unlock strategy -------------------------------
+
+/// Filename of the encrypted master-password credential (matches the daemon's
+/// `LoadCredentialEncrypted=` name and what unlock.rs reads).
+const CREDENTIAL_FILENAME: &str = "bw_master_password.cred";
+
+/// Let the user choose how the vault gets unlocked, provisioning the encrypted
+/// systemd credential if they pick auto-unlock. The plaintext master password
+/// is never written to disk: it is piped straight into `systemd-creds encrypt`.
+async fn provision_master_password(
+    config_path: &std::path::Path,
+    api_key: &ApiKeyInput,
+) -> Result<UnlockStrategy> {
+    step(4, "Master password / unlock strategy");
+    println!("The master password is what actually unlocks your vault. It is");
+    println!("never stored in plaintext. Choose how the daemon should obtain it:\n");
+
+    let choice = prompt_choice(
+        "Unlock strategy?",
+        &[
+            (
+                "credential",
+                "auto-unlock at startup from an encrypted systemd credential (recommended)",
+            ),
+            (
+                "on-demand",
+                "prompt via systemd-ask-password the first time SSH uses the agent",
+            ),
+        ],
+    )?;
+
+    if choice == "on-demand" {
+        println!("\nNo credential will be provisioned; the daemon will prompt on");
+        println!("first use. You can re-run `setup` later to switch to auto-unlock.");
+        return Ok(UnlockStrategy::OnDemand);
+    }
+
+    let cred_path = config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(CREDENTIAL_FILENAME);
+
+    if cred_path.exists() {
+        println!("\nAn encrypted credential already exists at {}.", cred_path.display());
+        match prompt_choice(
+            "What would you like to do?",
+            &[
+                ("overwrite", "re-encrypt with a newly-entered master password"),
+                ("reuse", "keep the existing credential"),
+                ("abort", "stop setup"),
+            ],
+        )? {
+            "reuse" => {
+                println!("Keeping existing credential.");
+                return Ok(UnlockStrategy::Credential);
+            }
+            "abort" => anyhow::bail!("aborted at master-password step"),
+            _ => {} // overwrite
+        }
+    }
+
+    // Collect the password (masked), verifying it actually unlocks the vault
+    // before we bother encrypting it, so a typo doesn't get baked into the cred.
+    let password = prompt_master_password_verified(api_key).await?;
+
+    encrypt_master_password_credential(&password, &cred_path).await?;
+    println!("Wrote encrypted credential to {} (0600).", cred_path.display());
+    Ok(UnlockStrategy::Credential)
+}
+
+/// Prompt (masked) for the master password and confirm it unlocks the vault.
+/// Loops until a working password is entered or the user aborts.
+async fn prompt_master_password_verified(api_key: &ApiKeyInput) -> Result<SecretString> {
+    let cli = BitwardenCli::new(api_key.server.clone());
+    loop {
+        let entered = rpassword::prompt_password("Bitwarden master password: ")
+            .context("reading master password")?;
+        if entered.is_empty() {
+            println!("Password was empty; please try again.");
+            continue;
+        }
+        let password = SecretString::from(entered);
+
+        println!("Verifying with `bw unlock`...");
+        match cli.unlock(&password).await {
+            // The returned session is dropped (zeroized) immediately; we only
+            // needed to confirm the password works.
+            Ok(_session) => return Ok(password),
+            Err(e) => {
+                println!("\nUnlock failed:\n{e:#}\n");
+                if !prompt_yes_no("Try a different password?", true)? {
+                    anyhow::bail!("aborted: master password not verified");
+                }
+            }
+        }
+    }
+}
+
+/// Pipe the master password into `systemd-creds encrypt`, writing the opaque
+/// blob to `cred_path`. The plaintext never touches a file, argv, or the shell.
+async fn encrypt_master_password_credential(
+    password: &SecretString,
+    cred_path: &std::path::Path,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    if let Some(parent) = cred_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating credential directory {}", parent.display()))?;
+    }
+
+    let mut child = Command::new("systemd-creds")
+        .args(["encrypt", "--name=bw_master_password", "-"])
+        .arg(cred_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning `systemd-creds encrypt` (is systemd installed?)")?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("failed to open stdin for systemd-creds")?;
+        stdin
+            .write_all(password.expose_secret().as_bytes())
+            .await
+            .context("writing master password to systemd-creds")?;
+        stdin.flush().await.ok();
+        // Dropping stdin closes it, signalling EOF to systemd-creds.
+    }
+
+    let out = child
+        .wait_with_output()
+        .await
+        .context("waiting for `systemd-creds encrypt`")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`systemd-creds encrypt` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    // Enforce 0600 on the credential blob (systemd-creds already does, but be
+    // explicit and consistent with the rest of the codebase).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(cred_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting permissions on {}", cred_path.display()))?;
+    }
     Ok(())
 }
 
