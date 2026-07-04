@@ -489,40 +489,77 @@ fn render_unit(
 fn print_ssh_auth_sock() {
     done_banner("Point SSH at the agent");
 
-    let (rc_hint, line) = shell_rc_hint();
-
     println!("Setup is complete and the daemon is running. The final step is");
-    println!("yours: tell SSH to use this agent by adding the line below to");
-    println!("your shell startup file{rc_hint}, then open a new terminal:\n");
-    println!("    {line}\n");
+    println!("yours: tell SSH to use this agent, then open a new terminal.\n");
+
+    match shell_rc_hint() {
+        ShellHint::Known { rc_file, line } => {
+            println!("Add the line below to your shell startup file ({rc_file}):\n");
+            println!("    {line}\n");
+        }
+        ShellHint::Ksh => {
+            println!(
+                "Add the line below to your shell startup file (~/.kshrc,\n\
+                 sourced only if `ENV=~/.kshrc` is set):\n"
+            );
+            println!("    export SSH_AUTH_SOCK=\"$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock\"\n");
+        }
+        ShellHint::Unknown => {
+            println!("Add the appropriate line to your shell's startup file. The syntax");
+            println!("to set an environment variable varies by shell:\n");
+            println!("  POSIX-style shells (bash, zsh, sh, ksh):");
+            println!("    export SSH_AUTH_SOCK=\"$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock\"\n");
+            println!("  csh / tcsh:");
+            println!("    setenv SSH_AUTH_SOCK \"$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock\"\n");
+            println!("  For anything else (nushell, elvish, ...) check your shell's docs.\n");
+        }
+    }
+
     println!("Then verify with:  ssh-add -l");
 }
 
-/// Pick a shell rc file and the matching export syntax from `$SHELL`.
-fn shell_rc_hint() -> (String, &'static str) {
+/// A shell-specific hint for setting `SSH_AUTH_SOCK`, derived from `$SHELL`.
+enum ShellHint {
+    /// A recognized shell with a known rc file and a single env-var line.
+    Known {
+        rc_file: &'static str,
+        line: &'static str,
+    },
+    /// ksh needs a note that `~/.kshrc` is only sourced when `ENV` points at it.
+    Ksh,
+    /// Unrecognized shell: show the common syntaxes and defer to its docs.
+    Unknown,
+}
+
+/// Pick a shell rc file and the matching env-var syntax from `$SHELL`.
+fn shell_rc_hint() -> ShellHint {
+    const POSIX: &str = "export SSH_AUTH_SOCK=\"$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock\"";
+    const CSH: &str = "setenv SSH_AUTH_SOCK \"$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock\"";
+
     let shell = std::env::var("SHELL").unwrap_or_default();
     let name = std::path::Path::new(&shell)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
 
+    let known = |rc_file, line| ShellHint::Known { rc_file, line };
+
     match name.as_str() {
-        "zsh" => (
-            " (~/.zshrc)".to_string(),
-            "export SSH_AUTH_SOCK=\"$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock\"",
-        ),
-        "bash" => (
-            " (~/.bashrc)".to_string(),
-            "export SSH_AUTH_SOCK=\"$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock\"",
-        ),
-        "fish" => (
-            " (~/.config/fish/config.fish)".to_string(),
+        "bash" => known("~/.bashrc", POSIX),
+        "zsh" => known("~/.zshrc", POSIX),
+        "fish" => known(
+            "~/.config/fish/config.fish",
             "set -gx SSH_AUTH_SOCK \"$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock\"",
         ),
-        _ => (
-            " (e.g. ~/.bashrc or ~/.zshrc)".to_string(),
-            "export SSH_AUTH_SOCK=\"$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock\"",
+        "ksh" => ShellHint::Ksh,
+        "dash" | "sh" => known("~/.profile", POSIX),
+        "csh" => known("~/.cshrc", CSH),
+        "tcsh" => known("~/.tcshrc", CSH),
+        "nu" => known(
+            "~/.config/nushell/env.nu",
+            "$env.SSH_AUTH_SOCK = ($env.XDG_RUNTIME_DIR | path join \"bitwarden-ssh-agent.sock\")",
         ),
+        _ => ShellHint::Unknown,
     }
 }
 
