@@ -13,8 +13,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use ssh_key::{HashAlg, PrivateKey};
+use ssh_key::{HashAlg, PrivateKey, PublicKey};
 use zeroize::Zeroize;
+
+use crate::bitwarden::SshKeyItem;
 
 /// A private key file discovered in the SSH directory, with everything the
 /// wizard needs to display it and (later) import it.
@@ -173,6 +175,58 @@ fn comment_from_pub_line(line: &str) -> Option<String> {
     (!comment.is_empty()).then(|| comment.to_string())
 }
 
+/// A pointer to an SSH Key item already in the vault, indexed by its computed
+/// fingerprint so freshly-scanned candidates can be deduped against it.
+struct VaultKeyRef {
+    /// Vault item UUID (needed to overwrite/edit it in place).
+    id: String,
+    /// The vault item's display name (shown when a duplicate is detected).
+    name: String,
+    /// `SHA256:...` fingerprint of the item's public key.
+    fingerprint: String,
+}
+
+/// Compute the SHA256 fingerprint of an OpenSSH public-key line, matching the
+/// `SHA256:...` format used for the local candidates so the two can be compared.
+fn fingerprint_of_public(public_openssh: &str) -> Option<String> {
+    let public = PublicKey::from_openssh(public_openssh).ok()?;
+    Some(public.fingerprint(HashAlg::Sha256).to_string())
+}
+
+/// Build a fingerprint index of the SSH Key items already in the vault.
+///
+/// The fingerprint is recomputed from each item's public key (authoritative and
+/// in our exact format), falling back to the item's stored `keyFingerprint`
+/// only if the public key can't be parsed. Items we cannot fingerprint at all
+/// are dropped from the index (they simply won't dedupe).
+fn index_vault_keys(items: &[SshKeyItem]) -> Vec<VaultKeyRef> {
+    let mut refs = Vec::with_capacity(items.len());
+    for item in items {
+        let fingerprint = fingerprint_of_public(&item.ssh_key.public_key)
+            .or_else(|| item.ssh_key.key_fingerprint.clone());
+        match fingerprint {
+            Some(fingerprint) => refs.push(VaultKeyRef {
+                id: item.id.clone(),
+                name: item.name.clone(),
+                fingerprint,
+            }),
+            None => log::debug!(
+                "vault item '{}' has no usable public key/fingerprint; not deduping against it",
+                item.name
+            ),
+        }
+    }
+    refs
+}
+
+/// Find an existing vault key with the same fingerprint as `candidate`.
+fn find_vault_match<'a>(
+    index: &'a [VaultKeyRef],
+    fingerprint: &str,
+) -> Option<&'a VaultKeyRef> {
+    index.iter().find(|r| r.fingerprint == fingerprint)
+}
+
 /// Resolve the SSH directory to scan: explicit override, else `~/.ssh`.
 fn resolve_ssh_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(dir) = explicit {
@@ -310,6 +364,57 @@ mod tests {
         // Fingerprint/public key are still available from the cleartext half.
         assert!(c.fingerprint.starts_with("SHA256:"));
         assert!(c.public_openssh.starts_with("ssh-ed25519 "));
+    }
+
+    fn vault_item(id: &str, name: &str, public_openssh: &str, fp: Option<&str>) -> SshKeyItem {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": name,
+            "sshKey": {
+                "privateKey": "PRIVATE-PLACEHOLDER",
+                "publicKey": public_openssh,
+                "keyFingerprint": fp,
+            },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn dedup_matches_candidate_against_vault_by_fingerprint() {
+        let key = gen_ed25519();
+        let public_openssh = key.public_key().to_openssh().unwrap();
+        let fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+
+        // Vault has this key (under a different item name) plus an unrelated one.
+        let other = gen_ed25519();
+        let items = vec![
+            vault_item("id-1", "Laptop key", &public_openssh, None),
+            vault_item(
+                "id-2",
+                "Some other key",
+                &other.public_key().to_openssh().unwrap(),
+                None,
+            ),
+        ];
+        let index = index_vault_keys(&items);
+        assert_eq!(index.len(), 2);
+
+        let hit = find_vault_match(&index, &fingerprint).expect("should find a match");
+        assert_eq!(hit.id, "id-1");
+        assert_eq!(hit.name, "Laptop key");
+
+        // A key not in the vault does not match.
+        let stranger = gen_ed25519();
+        let stranger_fp = stranger.public_key().fingerprint(HashAlg::Sha256).to_string();
+        assert!(find_vault_match(&index, &stranger_fp).is_none());
+    }
+
+    #[test]
+    fn dedup_falls_back_to_stored_fingerprint_when_public_key_unparseable() {
+        let items = vec![vault_item("id-x", "Odd key", "not-a-valid-public-key", Some("SHA256:stored"))];
+        let index = index_vault_keys(&items);
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0].fingerprint, "SHA256:stored");
     }
 
     #[test]
