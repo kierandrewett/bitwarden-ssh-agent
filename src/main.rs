@@ -8,6 +8,7 @@
 mod agent;
 mod bitwarden;
 mod config;
+mod control;
 mod setup;
 mod unlock;
 
@@ -50,6 +51,20 @@ enum Command {
     /// Interactively configure everything: `bw` CLI, API key, config file,
     /// master-password unlock strategy, and the systemd user service.
     Setup(SetupArgs),
+
+    /// Unlock the running daemon by typing your master password into this
+    /// terminal (the reliable interactive path — no systemd-ask-password agent
+    /// required). Prompts for the password and hands it to the daemon over its
+    /// local control socket.
+    Unlock(UnlockArgs),
+}
+
+#[derive(clap::Args)]
+struct UnlockArgs {
+    /// Path to the daemon's control socket.
+    /// Defaults to `$XDG_RUNTIME_DIR/bitwarden-ssh-agent.ctl`.
+    #[arg(long, value_name = "PATH")]
+    control_socket: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -85,7 +100,25 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Serve(args) => serve(args).await,
         Command::Setup(args) => setup::run(args.config).await,
+        Command::Unlock(args) => unlock_cli(args).await,
     }
+}
+
+/// `unlock` subcommand: prompt (masked) for the master password and hand it to
+/// the running daemon over its control socket.
+async fn unlock_cli(args: UnlockArgs) -> Result<()> {
+    let control_path = control::resolve_control_path(args.control_socket)?;
+
+    let password = inquire::Password::new("Bitwarden master password:")
+        .with_display_mode(inquire::PasswordDisplayMode::Masked)
+        .without_confirmation()
+        .with_help_message("Sent directly to the running daemon; never stored or echoed.")
+        .prompt()
+        .map_err(|e| anyhow::anyhow!("failed to read password: {e}"))?;
+    let password = secrecy::SecretString::from(password);
+
+    let code = control::run_unlock_client(&control_path, password).await?;
+    std::process::exit(code);
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
@@ -132,6 +165,30 @@ async fn serve(args: ServeArgs) -> Result<()> {
         "point SSH at it with: export SSH_AUTH_SOCK={}",
         socket_path.display()
     );
+
+    // Bind the small control socket for the `unlock` subcommand (same 0600 +
+    // stale-socket handling as the agent socket above), and serve it in the
+    // background so the user can always unlock interactively via their terminal.
+    match control::resolve_control_path(None) {
+        Ok(control_path) => match bind_socket(&control_path) {
+            Ok(control_listener) => {
+                log::info!("control socket listening on {}", control_path.display());
+                log::info!(
+                    "unlock the vault interactively with: bitwarden-ssh-agent unlock"
+                );
+                tokio::spawn(control::serve_control(control_listener, unlock.clone()));
+            }
+            Err(e) => log::error!(
+                "failed to bind control socket {}: {e:#}; the `unlock` subcommand \
+                 will not work this run",
+                control_path.display()
+            ),
+        },
+        Err(e) => log::error!(
+            "cannot determine control socket path: {e:#}; the `unlock` subcommand \
+             will not work this run"
+        ),
+    }
 
     // Refresh keys on SIGHUP so newly-added vault items can be picked up without
     // restarting the daemon (re-`bw sync` + reload, reusing the unlocked session).
