@@ -494,25 +494,133 @@ async fn execute_plans(
     session: &Session,
     dry_run: bool,
 ) -> Result<()> {
-    let _ = (cli, session);
+    // Fetch the new-item template once, only if we will actually create anything.
+    let will_create = !dry_run
+        && plans
+            .iter()
+            .any(|p| matches!(p, KeyPlan::Create { .. }));
+    let template = if will_create {
+        Some(
+            cli.item_template()
+                .await
+                .context("fetching the `bw` item template")?,
+        )
+    } else {
+        None
+    };
+
+    let mut created = Vec::new();
+    let mut overwritten = Vec::new();
+    let mut skipped = Vec::new();
+    let mut failed = Vec::new();
+
     println!("\n{}", separator());
-    println!("Summary:");
-    // Real creation is wired up in a later step; for now, describe the plan.
     for plan in &plans {
         match plan {
-            KeyPlan::Create { name, .. } => {
-                println!("  would create:    {name}");
+            KeyPlan::Create { name, payload } => {
+                if dry_run {
+                    println!("would create:    {name}");
+                    created.push(name.clone());
+                    continue;
+                }
+                let base = template.clone().expect("template fetched when creating");
+                let item = build_item_value(base, name, payload);
+                match cli.create_item(session, &item).await {
+                    Ok(id) => {
+                        println!("created:         {name}  (id {id})");
+                        created.push(name.clone());
+                    }
+                    Err(e) => {
+                        println!("FAILED to create {name}: {e:#}");
+                        failed.push(format!("{name}: {e:#}"));
+                    }
+                }
             }
-            KeyPlan::Overwrite { name, .. } => {
-                println!("  would overwrite: {name}");
+            KeyPlan::Overwrite { id, name, payload } => {
+                if dry_run {
+                    println!("would overwrite: {name}  (id {id})");
+                    overwritten.push(name.clone());
+                    continue;
+                }
+                match overwrite_item(cli, session, id, name, payload).await {
+                    Ok(()) => {
+                        println!("overwritten:     {name}  (id {id})");
+                        overwritten.push(name.clone());
+                    }
+                    Err(e) => {
+                        println!("FAILED to overwrite {name}: {e:#}");
+                        failed.push(format!("{name}: {e:#}"));
+                    }
+                }
             }
             KeyPlan::Skip { name, reason } => {
-                println!("  skipped:         {name} ({reason})");
+                println!("skipped:         {name} ({reason})");
+                skipped.push(name.clone());
             }
         }
     }
-    let _ = dry_run;
+
+    println!("\n{}", separator());
+    let verb = if dry_run { "would import" } else { "imported" };
+    println!(
+        "Done. {verb}: {} created, {} overwritten; {} skipped; {} failed.",
+        created.len(),
+        overwritten.len(),
+        skipped.len(),
+        failed.len(),
+    );
+    if !failed.is_empty() {
+        println!("\nFailures:");
+        for f in &failed {
+            println!("  - {f}");
+        }
+    }
+
     Ok(())
+}
+
+/// Overwrite an existing vault item's key material, preserving its other fields.
+async fn overwrite_item(
+    cli: &BitwardenCli,
+    session: &Session,
+    id: &str,
+    name: &str,
+    payload: &SshKeyPayload,
+) -> Result<()> {
+    let existing = cli
+        .get_item(session, id)
+        .await
+        .context("fetching the existing vault item to overwrite")?;
+    let item = build_item_value(existing, name, payload);
+    cli.edit_item(session, id, &item).await?;
+    Ok(())
+}
+
+/// Merge an SSH Key payload into a base object (an item template for a new item,
+/// or the existing item for an overwrite), producing a valid type-5 item.
+fn build_item_value(base: serde_json::Value, name: &str, payload: &SshKeyPayload) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+
+    let mut map = match base {
+        Value::Object(m) => m,
+        _ => Map::new(),
+    };
+    map.insert("type".to_string(), json!(5));
+    map.insert("name".to_string(), json!(name));
+    map.insert(
+        "sshKey".to_string(),
+        json!({
+            "privateKey": payload.private_key,
+            "publicKey": payload.public_key,
+            "keyFingerprint": payload.fingerprint,
+        }),
+    );
+    // A type-5 item carries none of the other type-specific payloads; null them
+    // so a template (or a converted item) can't smuggle a stale login/card in.
+    for key in ["login", "secureNote", "card", "identity"] {
+        map.insert(key.to_string(), Value::Null);
+    }
+    Value::Object(map)
 }
 
 /// Log in (via the configured API key, or a prior `bw login`) and unlock the
@@ -782,6 +890,36 @@ mod tests {
         let index = index_vault_keys(&items);
         assert_eq!(index.len(), 1);
         assert_eq!(index[0].fingerprint, "SHA256:stored");
+    }
+
+    #[test]
+    fn build_item_value_produces_type5_ssh_key_shape() {
+        let template = serde_json::json!({
+            "type": 1,
+            "name": "",
+            "notes": null,
+            "favorite": false,
+            "login": { "username": "leftover" },
+            "sshKey": null,
+        });
+        let payload = SshKeyPayload {
+            private_key: "PRIV".to_string(),
+            public_key: "ssh-ed25519 AAAA comment".to_string(),
+            fingerprint: "SHA256:abc".to_string(),
+        };
+        let item = build_item_value(template, "my key", &payload);
+
+        assert_eq!(item["type"], serde_json::json!(5));
+        assert_eq!(item["name"], serde_json::json!("my key"));
+        assert_eq!(item["sshKey"]["privateKey"], serde_json::json!("PRIV"));
+        assert_eq!(
+            item["sshKey"]["publicKey"],
+            serde_json::json!("ssh-ed25519 AAAA comment")
+        );
+        assert_eq!(item["sshKey"]["keyFingerprint"], serde_json::json!("SHA256:abc"));
+        // Preserved unrelated field, cleared the stale login payload.
+        assert_eq!(item["favorite"], serde_json::json!(false));
+        assert_eq!(item["login"], serde_json::Value::Null);
     }
 
     #[test]

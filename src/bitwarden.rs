@@ -11,6 +11,7 @@ use std::process::Stdio;
 use anyhow::{anyhow, bail, Context, Result};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use zeroize::Zeroize;
 
@@ -285,6 +286,142 @@ impl BitwardenCli {
         }
         Ok(keys)
     }
+
+    /// Fetch the JSON template for a new vault item (`bw get template item`).
+    ///
+    /// Used as the base object for a freshly-created SSH Key item so every field
+    /// the CLI expects is present. Templates need no session, but one is passed
+    /// for consistency with the surrounding create/edit calls.
+    pub async fn item_template(&self) -> Result<serde_json::Value> {
+        let out = self
+            .base_command()
+            .args(["get", "template", "item"])
+            .output()
+            .await
+            .context("running `bw get template item`")?;
+        if !out.status.success() {
+            bail!("`bw get template item` failed: {}", stderr(&out.stderr));
+        }
+        serde_json::from_slice(&out.stdout).context("parsing `bw get template item` output")
+    }
+
+    /// Fetch a single vault item by id (`bw get item <id>`), as raw JSON.
+    ///
+    /// Used before an overwrite so the existing item's other fields (folder,
+    /// favorite, ...) are preserved when we replace only its key material.
+    pub async fn get_item(&self, session: &Session, id: &str) -> Result<serde_json::Value> {
+        let out = self
+            .base_command()
+            .args(["get", "item", id])
+            .env("BW_SESSION", session.expose())
+            .output()
+            .await
+            .context("running `bw get item`")?;
+        if !out.status.success() {
+            bail!("`bw get item {id}` failed: {}", stderr(&out.stderr));
+        }
+        serde_json::from_slice(&out.stdout).context("parsing `bw get item` output")
+    }
+
+    /// Create a new vault item from a JSON value (`bw create item`).
+    ///
+    /// The item JSON is base64-encoded via `bw encode` and both stages are fed
+    /// through stdin, so the private key never appears in argv (where `ps` could
+    /// see it). Returns the new item's id.
+    pub async fn create_item(
+        &self,
+        session: &Session,
+        item: &serde_json::Value,
+    ) -> Result<String> {
+        let encoded = self.encode_item(item).await?;
+        let out = self
+            .run_capturing_stdin(&["create", "item"], Some(session), &encoded)
+            .await
+            .context("running `bw create item`")?;
+        parse_item_id(&out)
+    }
+
+    /// Replace an existing vault item in place (`bw edit item <id>`). Same
+    /// stdin/encoding hygiene as [`Self::create_item`].
+    pub async fn edit_item(
+        &self,
+        session: &Session,
+        id: &str,
+        item: &serde_json::Value,
+    ) -> Result<String> {
+        let encoded = self.encode_item(item).await?;
+        let out = self
+            .run_capturing_stdin(&["edit", "item", id], Some(session), &encoded)
+            .await
+            .context("running `bw edit item`")?;
+        parse_item_id(&out)
+    }
+
+    /// Serialize `item` to JSON and base64-encode it via `bw encode` (fed on
+    /// stdin). The intermediate JSON bytes are zeroized once encoded.
+    async fn encode_item(&self, item: &serde_json::Value) -> Result<Vec<u8>> {
+        let mut json = serde_json::to_vec(item).context("serializing item JSON")?;
+        let result = self.run_capturing_stdin(&["encode"], None, &json).await;
+        json.zeroize();
+        let mut encoded = result.context("running `bw encode`")?;
+        // `bw encode` appends a trailing newline; trim it so the value passed on
+        // to `create`/`edit` is a clean base64 string.
+        while matches!(encoded.last(), Some(b'\n' | b'\r')) {
+            encoded.pop();
+        }
+        Ok(encoded)
+    }
+
+    /// Run `bw <args...>` feeding `input` on stdin (never argv), optionally with
+    /// a session, returning captured stdout on success.
+    async fn run_capturing_stdin(
+        &self,
+        args: &[&str],
+        session: Option<&Session>,
+        input: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut cmd = self.base_command();
+        cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(session) = session {
+            cmd.env("BW_SESSION", session.expose());
+        }
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("spawning `bw {}`", args.join(" ")))?;
+
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .context("failed to open stdin for `bw`")?;
+            stdin
+                .write_all(input)
+                .await
+                .context("writing to `bw` stdin")?;
+            stdin.flush().await.ok();
+            // Dropping stdin closes it, signalling EOF.
+        }
+
+        let out = child
+            .wait_with_output()
+            .await
+            .with_context(|| format!("waiting for `bw {}`", args.join(" ")))?;
+        if !out.status.success() {
+            bail!("`bw {}` failed: {}", args.join(" "), stderr(&out.stderr));
+        }
+        Ok(out.stdout)
+    }
+}
+
+/// Extract the `id` field from a `bw create/edit item` JSON response.
+fn parse_item_id(stdout: &[u8]) -> Result<String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(stdout).context("parsing `bw create/edit item` output")?;
+    value
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("`bw` response did not contain an item id"))
 }
 
 /// Output of `bw status`.
