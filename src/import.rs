@@ -706,6 +706,9 @@ async fn open_vault_session(config: Option<PathBuf>) -> Result<(BitwardenCli, Se
     };
     let cli = BitwardenCli::new(cfg.server.clone());
 
+    println!("To check your vault for duplicates and import the keys you pick, this");
+    println!("needs to log in and unlock your Bitwarden vault next.\n");
+
     // Ensure the device is logged in.
     match &cfg.api_key {
         Some(api_key) => cli
@@ -724,6 +727,8 @@ async fn open_vault_session(config: Option<PathBuf>) -> Result<(BitwardenCli, Se
     }
 
     // Unlock with the master password typed here (masked). Loop on a wrong one.
+    println!("Enter your Bitwarden master password below (typed directly here, masked,");
+    println!("and never written to disk or logged) to unlock the vault:\n");
     loop {
         let password = SecretString::from(prompt_secret("Bitwarden master password:")?);
         match cli.unlock(&password).await {
