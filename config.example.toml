@@ -1,0 +1,16 @@
+# Copy to ~/.config/bitwarden-ssh-agent/config.toml and `chmod 600` it.
+#
+# This file holds ONLY the Bitwarden personal API key (device auth). It does
+# NOT — and must never — contain your master password. The master password is
+# supplied separately, via a systemd credential or an on-demand
+# systemd-ask-password prompt (see the README).
+#
+# You can also provide these via the BW_CLIENTID / BW_CLIENTSECRET environment
+# variables (e.g. a systemd EnvironmentFile), which take precedence over this
+# file.
+
+client_id = "user.00000000-0000-0000-0000-000000000000"
+client_secret = "your-api-key-secret"
+
+# Optional: only for self-hosted Bitwarden / Vaultwarden. Omit for bitwarden.com.
+# server = "https://vault.example.com"
