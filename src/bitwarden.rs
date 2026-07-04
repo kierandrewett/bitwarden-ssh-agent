@@ -290,12 +290,14 @@ impl BitwardenCli {
     /// Fetch the JSON template for a new vault item (`bw get template item`).
     ///
     /// Used as the base object for a freshly-created SSH Key item so every field
-    /// the CLI expects is present. Templates need no session, but one is passed
-    /// for consistency with the surrounding create/edit calls.
-    pub async fn item_template(&self) -> Result<serde_json::Value> {
+    /// the CLI expects is present. Despite being static data, `bw` still checks
+    /// the vault's lock status for this command and fails with "Vault is
+    /// locked." without a session, so one is required here too.
+    pub async fn item_template(&self, session: &Session) -> Result<serde_json::Value> {
         let out = self
             .base_command()
             .args(["get", "template", "item"])
+            .env("BW_SESSION", session.expose())
             .output()
             .await
             .context("running `bw get template item`")?;

@@ -601,7 +601,7 @@ async fn execute_plans(
             .any(|p| matches!(p, KeyPlan::Create { .. }));
     let template = if will_create {
         Some(
-            with_spinner("Fetching the `bw` item template...", cli.item_template())
+            with_spinner("Fetching the `bw` item template...", cli.item_template(session))
                 .await
                 .context("fetching the `bw` item template")?,
         )
