@@ -1,167 +1,91 @@
 # bitwarden-ssh-agent
 
-A headless SSH agent daemon that sources your SSH private keys from your
-**Bitwarden vault** instead of loose files on disk.
-
-If you reinstall your laptop or hop between machines, your SSH keys come with
-you: store them once as Bitwarden **SSH Key** items and this agent serves them
-over the standard SSH agent protocol. It is designed to run as a
-`systemd --user` service — no GUI required (unlike Bitwarden's built-in desktop
-agent).
-
-## Security model
-
-- Private keys are fetched from the vault, parsed, and held only in this
-  process's memory — never written to disk in plaintext.
-- Signing happens in-process (RustCrypto). The daemon speaks the SSH agent
-  protocol on a Unix socket, so agent-forwarding works transparently.
-- The socket lives at `$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock`, created
-  `0600`. A stale socket from a previous run is removed on startup.
-- Secrets in flight (master password, `BW_SESSION`, API secret) are wrapped in
-  `secrecy`/`zeroize` and passed to the `bw` subprocess through its own
-  environment — never process-wide env, never on the command line, never
-  logged.
-- The master password is never stored in any config file — it's provided
-  either as a systemd credential or typed on demand (see below). The config
-  file holds only the Bitwarden API key (device auth), and the daemon refuses
-  to read it if its permissions are looser than `0600`.
-- RSA signatures use the client's requested algorithm (`rsa-sha2-256` /
-  `rsa-sha2-512`); the deprecated SHA-1 `ssh-rsa` is never used.
+A headless SSH agent that serves keys stored as Bitwarden **SSH Key** vault
+items over the standard ssh-agent protocol. Runs as a `systemd --user`
+service, no GUI required.
 
 ## How it works
 
-Bitwarden has no usable Rust SDK for the personal vault, so this daemon shells
-out to the official **`bw` CLI** to read items. Authentication has two steps:
+Shells out to the `bw` CLI (no usable Rust SDK exists). Two-step auth:
 
-1. **Device auth** with your personal **API key** (`bw login --apikey`). This
-   only authenticates the device — the vault is still *locked* afterward.
-2. **Unlock** with your **master password** (`bw unlock`), which yields a session
-   key that decrypts items. There is no way around needing the master password
-   at unlock time.
+1. `bw login --apikey` — device auth via your Bitwarden API key. Vault stays locked.
+2. `bw unlock` — master password, yields a session key. No way around this.
 
-Once unlocked, all SSH Key items are parsed and cached in memory for the
-daemon's lifetime.
+Once unlocked, SSH Key items are parsed and cached in memory for the daemon's
+lifetime (no re-lock timer — single-user machine daemon).
+
+## Security model
+
+- Keys are held only in process memory, never written to disk in plaintext.
+- Signing happens in-process (RustCrypto) over a Unix socket
+  (`$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock`, `0600`; stale sockets removed
+  on startup).
+- Master password / `BW_SESSION` / API secret are wrapped in
+  `secrecy`/`zeroize`, passed to `bw` via its own env — never process-wide
+  env, command line, or logs.
+- Master password is never stored in config. Config holds only the API key,
+  and is rejected if permissions are looser than `0600`.
+- RSA signing uses `rsa-sha2-256`/`512`, never the deprecated `ssh-rsa` (SHA-1).
 
 ## Prerequisites
 
-- **Rust** (to build) — <https://rustup.rs>.
-- The **Bitwarden CLI** (`bw`), which needs Node.js:
-  ```sh
-  npm install -g @bitwarden/cli
-  ```
-  Make sure `bw` is on your `PATH`. (You can override the binary location with
-  the `BW_CLI_PATH` environment variable.)
-- **systemd** (for the service and the `systemd-ask-password` prompt).
-- One or more Bitwarden items of type **SSH Key** in your vault (Bitwarden can
-  generate Ed25519 keys, or you can import existing RSA/ECDSA/Ed25519 keys).
-
-## Create a Bitwarden API key
-
-1. Log in to the Bitwarden web vault.
-2. Go to **Account settings → Security → Keys**.
-3. Under **API key**, click **View API Key**.
-4. Copy the `client_id` (`user.…`) and `client_secret`.
-
-This API key only authenticates the device; it cannot unlock the vault on its
-own.
+- Rust (to build) — <https://rustup.rs>
+- Bitwarden CLI: `npm install -g @bitwarden/cli` (on `PATH`, or set `BW_CLI_PATH`)
+- systemd (service + `systemd-ask-password`)
+- At least one Bitwarden item of type **SSH Key**
 
 ## Build & install
 
 ```sh
 git clone https://github.com/kierandrewett/bitwarden-ssh-agent
 cd bitwarden-ssh-agent
-cargo install --path .        # installs to ~/.cargo/bin/bitwarden-ssh-agent
+cargo install --path .        # -> ~/.cargo/bin/bitwarden-ssh-agent
 ```
 
-(If you prefer a system location, `cargo build --release` and copy
-`target/release/bitwarden-ssh-agent` to `/usr/local/bin`, then adjust
-`ExecStart=` in the unit file.)
-
-## Quick start: `bitwarden-ssh-agent setup` (recommended)
-
-Once the binary is built, one command does everything the manual sections
-below describe — no hand-editing of config or unit files:
+## Setup
 
 ```sh
 bitwarden-ssh-agent setup
 ```
 
-It walks you through, prompting at each step (and asking before overwriting
-anything, so it is safe to re-run):
+Interactive, idempotent (asks before overwriting). Handles all of:
 
-1. **Checks for the `bw` CLI** and offers to `npm install -g @bitwarden/cli`
-   it for you if it's missing (it won't run a global npm install without
-   asking first).
-2. **Collects your Bitwarden API key** (`client_id` / `client_secret`, plus an
-   optional self-hosted server URL) and **validates it** by actually running
-   `bw login --apikey` before writing anything.
-3. **Writes `~/.config/bitwarden-ssh-agent/config.toml`** with `0600`
-   permissions.
-4. **Sets up master-password unlock** — asks a single yes/no: set up
-   auto-unlock at startup? If yes, it provisions an encrypted systemd
-   credential (prompting for the password with masked input, verifying it
-   unlocks the vault, then piping it straight into `systemd-creds encrypt
-   --user`; the plaintext never touches disk or your shell history). Either
-   way, whenever the daemon starts locked you can unlock it interactively with
-   `bitwarden-ssh-agent unlock`, which prompts in your own terminal and hands
-   the password to the running daemon — the reliable, headless-friendly path.
-5. **Installs the `systemd --user` unit** with `ExecStart=` pointing at the
-   binary you just built.
-6. **Enables and starts** the service and checks it came up.
+1. Installs `bw` if missing (asks first).
+2. Prompts for your Bitwarden API key (`client_id`/`client_secret` + optional
+   server URL), validates with `bw login --apikey`.
+3. Writes `~/.config/bitwarden-ssh-agent/config.toml` (`0600`).
+4. Asks whether to set up auto-unlock at startup (provisions an encrypted
+   systemd credential; plaintext never touches disk/history). Either way,
+   `bitwarden-ssh-agent unlock` unlocks a running daemon on demand.
+5. Installs and enables the `systemd --user` unit.
+6. Prints the `SSH_AUTH_SOCK` line to add to your shell rc.
 
-Finally it **prints the `SSH_AUTH_SOCK` line** to add to your shell rc.
+Get the API key for step 2 from the web vault: **Account settings → Security
+→ Keys → View API Key**.
 
-The remaining sections document the same steps done by hand, for anyone who
-wants to see exactly what `setup` automates, doesn't use systemd, or prefers to
-manage the pieces themselves.
+The [Manual setup](#manual-setup) section below covers the same steps by hand.
 
-## Import existing keys: `bitwarden-ssh-agent import`
+## Import existing keys
 
-Already have SSH private keys in `~/.ssh` (e.g. `id_ed25519`) that you want in
-your vault? Rather than pasting each one into the web vault by hand — which has
-no reliable "import from clipboard" button (only the desktop app and browser
-extension do) — this subcommand imports them for you with a wizard, so you stay
-in control:
+Bring keys already in `~/.ssh` (e.g. `id_ed25519`) into the vault:
 
 ```sh
-bitwarden-ssh-agent import          # add --dry-run to preview, changing nothing
+bitwarden-ssh-agent import          # --dry-run to preview, --ssh-dir <PATH> for a different dir
 ```
 
-It:
-
-1. **Scans `~/.ssh`** for files that parse as OpenSSH private keys (skipping
-   `known_hosts`, `config`, `authorized_keys`, `*.pub`, and anything that isn't
-   a key). For each it shows the path, algorithm, `SHA256:` fingerprint,
-   comment, whether it's **passphrase-protected**, and whether it's **already in
-   your vault**.
-2. **Unlocks its own `bw` session** (prompting, masked, for your master
-   password — the same as `unlock`; nothing is stored) and lists the SSH Key
-   items already present so duplicates are flagged, not re-added.
-3. **Lets you pick exactly which keys to import** with a multi-select list
-   (pre-selecting the ones not already in the vault and not passphrase-
-   protected). Per key it then asks, as needed:
-   - **already in the vault?** skip, or overwrite the existing item in place.
-   - **passphrase-protected?** the agent can't yet sign with encrypted keys, so
-     you choose: *decrypt now* (enter the passphrase; the decrypted key is
-     stored so the agent can use it — protected at rest by Bitwarden's own
-     encryption, the same as every other vault key), *store the encrypted blob*
-     (backup only, unusable until decrypted), or *skip*.
-   - the **item name** (defaults to something like `id_ed25519 (user@host)`).
-4. **Creates the items** via the `bw` CLI (the private key is piped through
-   stdin, never the command line) and prints a summary of what was created,
-   overwritten, skipped, and why.
-5. If the daemon is running, **offers to send it a `SIGHUP`** so the new keys are
-   served immediately without a restart.
-
-`--dry-run` runs the entire wizard but prints what it *would* create instead of
-touching the vault, so you can preview safely first. `--ssh-dir <PATH>` scans a
-different directory.
+1. Scans `~/.ssh` for OpenSSH private keys, showing algorithm, fingerprint,
+   passphrase status, and whether each is already in the vault.
+2. Unlocks its own `bw` session (prompts for master password).
+3. Multi-select which keys to import. Per key: skip/overwrite if already
+   present; if passphrase-protected, choose decrypt now / store encrypted
+   blob (backup only) / skip; set the item name.
+4. Creates vault items via `bw` (key piped through stdin, never argv).
+5. If the daemon is running, offers a `SIGHUP` to pick up the new keys
+   without a restart.
 
 ## Manual setup
 
-### Configure the API key
-
-Create `~/.config/bitwarden-ssh-agent/config.toml` from the example:
+### API key config
 
 ```sh
 mkdir -p ~/.config/bitwarden-ssh-agent
@@ -170,115 +94,78 @@ chmod 600 ~/.config/bitwarden-ssh-agent/config.toml
 $EDITOR ~/.config/bitwarden-ssh-agent/config.toml
 ```
 
-Alternatively, set `BW_CLIENTID` / `BW_CLIENTSECRET` in the environment (e.g. a
-systemd `EnvironmentFile=`, `chmod 600`). Environment variables take precedence
-over the config file. **Do not put your master password here.**
+Or set `BW_CLIENTID`/`BW_CLIENTSECRET` in the environment (takes precedence
+over the config file). Never put the master password here.
 
-### Install the systemd user service
+### systemd user service
 
 ```sh
 mkdir -p ~/.config/systemd/user
 cp packaging/bitwarden-ssh-agent.service ~/.config/systemd/user/
-# (edit the copy if bw/node live somewhere other than ~/.npm-global/bin)
+# edit if bw/node aren't on ~/.npm-global/bin
 systemctl --user daemon-reload
 systemctl --user enable --now bitwarden-ssh-agent.service
-systemctl --user status bitwarden-ssh-agent.service
 journalctl --user -u bitwarden-ssh-agent.service -f
 ```
 
-### Supplying the master password
+### Master password
 
-The vault can only be unlocked with your master password. You provision it one
-of two ways below. Whichever you pick, whenever the daemon is running but
-**locked** — no credential, or the credential failed — unlock it interactively:
+Unlock a running-but-locked daemon interactively any time:
 
 ```sh
 bitwarden-ssh-agent unlock
 ```
 
-This prompts (masked) for your master password in your **own terminal** and
-hands it to the running daemon over a local control socket
-(`$XDG_RUNTIME_DIR/bitwarden-ssh-agent.ctl`, `0600`). It always works, headless
-or not, and reports clearly on success or a wrong password. It reuses the same
-single-flight unlock state as the daemon, so it is safe to run even while a
-first SSH request is racing to unlock. This is the reliable interactive path;
-use it after a reboot if you did not provision auto-unlock.
+Prompts (masked) in your own terminal, hands the password to the daemon over
+a control socket (`$XDG_RUNTIME_DIR/bitwarden-ssh-agent.ctl`, `0600`). Safe
+to run concurrently with an in-flight SSH request — unlock is single-flight.
 
-#### A) Auto-unlock at startup with a systemd credential (recommended)
-
-Encrypt the master password once (systemd stores an opaque, host-bound blob —
-not the plaintext). The `--user` flag is **required**: it produces a
-*user-scoped* credential that a `systemd --user` service can decrypt. Without
-it the blob is *system*-scoped and the daemon fails to decrypt it at startup
-with `Scope mismatch`, silently skipping it (so the vault stays locked):
+**Auto-unlock at startup (recommended)** — provision a systemd credential.
+`--user` is required (produces a user-scoped credential a `systemd --user`
+service can decrypt; without it you get `Scope mismatch` and the daemon stays
+locked):
 
 ```sh
 systemd-creds encrypt --user --name=bw_master_password - \
     ~/.config/bitwarden-ssh-agent/bw_master_password.cred
-# type your master password, then press Ctrl-D
+# type master password, Ctrl-D
 chmod 600 ~/.config/bitwarden-ssh-agent/bw_master_password.cred
 ```
 
-Then uncomment this line in the unit file and reload:
+Uncomment in the unit file and reload:
 
 ```ini
 LoadCredentialEncrypted=bw_master_password:%h/.config/bitwarden-ssh-agent/bw_master_password.cred
 ```
 
-The daemon reads it from `$CREDENTIALS_DIRECTORY/bw_master_password` and unlocks
-the vault immediately at startup.
-
-#### B) No credential provisioned (unlock on demand)
-
-If you provision no credential, the daemon still starts — in a **locked** state.
-Run `bitwarden-ssh-agent unlock` (above) to unlock it; this is the reliable
-path and is what you should use after a reboot.
-
-As a bonus, the **first** time an SSH client uses the agent while locked, the
-daemon also makes a best-effort `systemd-ask-password` prompt. This only
-succeeds if some ask-password *agent* is watching the queue (e.g. you run
-`systemd-tty-ask-password-agent --watch`, or a plymouth/GUI frontend). On a
-typical headless `systemd --user` service nothing is, so that prompt fails fast
-(short timeout) rather than hanging — fall back to `unlock`. Either way, if
-several SSH connections race in during the locked window, only **one** unlock
-runs and the rest wait on it.
-
-Once unlocked (either way), the daemon stays unlocked in memory for its
-lifetime — this is a personal single-user machine daemon, so there is no re-lock
-timer.
+**No credential provisioned** — daemon starts locked. Use
+`bitwarden-ssh-agent unlock` after reboot. It also makes a best-effort
+`systemd-ask-password` attempt on first use, which only succeeds if an
+ask-password agent is watching the queue (not the case on a typical headless
+service) — it fails fast rather than hanging.
 
 ### Point SSH at the agent
 
-The socket path is fixed and predictable, so just export it (e.g. in your shell
-rc):
-
 ```sh
 export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/bitwarden-ssh-agent.sock"
-```
-
-Then use SSH normally:
-
-```sh
-ssh-add -l          # list the keys the agent is serving
-ssh you@server      # authenticates via the agent; forwarding works
+ssh-add -l
+ssh you@server
 ```
 
 ## Configuration reference
 
-Config file (`~/.config/bitwarden-ssh-agent/config.toml`, `0600`):
+`~/.config/bitwarden-ssh-agent/config.toml` (`0600`):
 
-| Key             | Env override      | Purpose                                   |
-| --------------- | ----------------- | ----------------------------------------- |
-| `client_id`     | `BW_CLIENTID`     | Bitwarden API key client id (`user.…`)    |
-| `client_secret` | `BW_CLIENTSECRET` | Bitwarden API key secret                  |
-| `server`        | `BW_SERVER`       | Self-hosted server URL (optional)         |
+| Key             | Env override      | Purpose                                |
+| --------------- | ------------------ | --------------------------------------- |
+| `client_id`     | `BW_CLIENTID`      | Bitwarden API key client id (`user.…`) |
+| `client_secret` | `BW_CLIENTSECRET`  | Bitwarden API key secret               |
+| `server`        | `BW_SERVER`        | Self-hosted server URL (optional)      |
 
-Other environment variables:
-
-| Variable      | Purpose                                             |
-| ------------- | --------------------------------------------------- |
-| `BW_CLI_PATH` | Full path to the `bw` binary if not on `PATH`       |
-| `RUST_LOG`    | Log level (`info` default; `debug` for more detail) |
+| Env var       | Purpose                                       |
+| ------------- | ---------------------------------------------- |
+| `BW_CLI_PATH` | Path to `bw` binary if not on `PATH`           |
+| `RUST_LOG`    | Log level (`info` default, `debug` for more)   |
 
 ## CLI
 
@@ -289,23 +176,13 @@ bitwarden-ssh-agent unlock [--control-socket <PATH>]
 bitwarden-ssh-agent import [--ssh-dir <PATH>] [--config <PATH>] [--dry-run]
 ```
 
-`setup` runs the interactive one-command configuration flow (see
-[Quick start](#quick-start-bitwarden-ssh-agent-setup-recommended)). `serve` runs
-the daemon: `--socket` overrides the socket path and `--config` overrides the
-config file location. `unlock` unlocks a running daemon from your terminal.
-`import` brings existing `~/.ssh` private keys into the vault as SSH Key items
-(see [Import existing keys](#import-existing-keys-bitwarden-ssh-agent-import));
-`--dry-run` previews without changing anything. A subcommand is required —
-running the bare command with no subcommand prints help and exits without
-starting the daemon. Run `--help` for details.
+A subcommand is required; bare invocation prints help. `--help` for details.
 
 ## Troubleshooting
 
-- **`Bitwarden CLI check failed … No such file or directory`** — `bw` isn't on
-  the service's `PATH`. Fix `Environment=PATH=…` in the unit or set
-  `BW_CLI_PATH`.
-- **`bw unlock failed (wrong master password?)`** — the supplied master password
-  was rejected.
+- **`Bitwarden CLI check failed … No such file or directory`** — `bw` isn't
+  on the service's `PATH`; fix `Environment=PATH=…` or set `BW_CLI_PATH`.
+- **`bw unlock failed (wrong master password?)`** — password was rejected.
 - **`vault unlocked but contains no usable SSH Key items`** — add an item of
-  type *SSH Key* in Bitwarden.
-- Watch logs with `journalctl --user -u bitwarden-ssh-agent.service -f`.
+  type SSH Key in Bitwarden.
+- Logs: `journalctl --user -u bitwarden-ssh-agent.service -f`
