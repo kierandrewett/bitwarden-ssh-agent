@@ -74,6 +74,11 @@ enum Command {
     /// (it reuses the session it's already unlocked with). Useful after adding
     /// or editing SSH Key items directly in Bitwarden.
     Refresh(RefreshArgs),
+
+    /// Show the keys the daemon is currently serving (algorithm, fingerprint,
+    /// comment) — like `ssh-add -l`, but talks to the daemon directly, so it
+    /// works without `$SSH_AUTH_SOCK` set or `ssh-add` installed.
+    List(ListArgs),
 }
 
 #[derive(clap::Args)]
@@ -109,6 +114,14 @@ struct UnlockArgs {
 
 #[derive(clap::Args)]
 struct RefreshArgs {
+    /// Path to the daemon's control socket.
+    /// Defaults to `$XDG_RUNTIME_DIR/bitwarden-ssh-agent.ctl`.
+    #[arg(long, value_name = "PATH")]
+    control_socket: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct ListArgs {
     /// Path to the daemon's control socket.
     /// Defaults to `$XDG_RUNTIME_DIR/bitwarden-ssh-agent.ctl`.
     #[arg(long, value_name = "PATH")]
@@ -153,7 +166,15 @@ async fn main() -> Result<()> {
             import::run(args.ssh_dir, args.config, args.dry_run, args.control_socket).await
         }
         Command::Refresh(args) => refresh_cli(args).await,
+        Command::List(args) => list_cli(args).await,
     }
+}
+
+/// `list` subcommand: ask the running daemon what keys it's currently serving.
+async fn list_cli(args: ListArgs) -> Result<()> {
+    let control_path = control::resolve_control_path(args.control_socket)?;
+    let code = control::run_list_client(&control_path).await?;
+    std::process::exit(code);
 }
 
 /// `refresh` subcommand: ask the running daemon to re-sync the vault and

@@ -20,6 +20,13 @@ use crate::unlock::UnlockManager;
 const RSA_SHA2_256: u32 = 0x02;
 const RSA_SHA2_512: u32 = 0x04;
 
+/// A human-readable summary of a served key, for the `list` subcommand.
+pub struct KeySummary {
+    pub algorithm: String,
+    pub fingerprint: String,
+    pub comment: String,
+}
+
 /// A single decrypted SSH key held in memory.
 pub struct VaultKey {
     /// The parsed private key (zeroizes its own secret material on drop).
@@ -61,6 +68,17 @@ impl VaultKey {
     fn identity(&self) -> Identity {
         Identity {
             credential: PublicCredential::Key(self.public.clone()),
+            comment: self.comment.clone(),
+        }
+    }
+
+    /// A human-readable summary for the `list` subcommand — the same
+    /// information `ssh-add -l` shows, without needing `$SSH_AUTH_SOCK` set or
+    /// `ssh-add` installed (this queries the daemon directly).
+    pub fn summary(&self) -> KeySummary {
+        KeySummary {
+            algorithm: self.public.algorithm().as_str().to_string(),
+            fingerprint: self.public.fingerprint(HashAlg::Sha256).to_string(),
             comment: self.comment.clone(),
         }
     }

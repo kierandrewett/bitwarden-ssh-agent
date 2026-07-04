@@ -21,6 +21,11 @@
 //! - [`CMD_REFRESH`]: no body — re-syncs the vault and reloads keys using the
 //!   session already unlocked (e.g. by `import`, after adding new vault items,
 //!   without needing `systemctl kill -HUP` or the master password again).
+//! - [`CMD_LIST`]: no body — returns a summary of the keys currently served
+//!   (algorithm, fingerprint, comment), the same thing `ssh-add -l` shows, but
+//!   without needing `$SSH_AUTH_SOCK` set or `ssh-add` installed. Like the SSH
+//!   agent protocol itself, this triggers on-demand unlock if the vault is
+//!   currently locked.
 //!
 //! Response (daemon → client): `[u8 status][UTF-8 message]`, read to EOF.
 //! `status` is one of [`STATUS_OK`], [`STATUS_WRONG_PASSWORD`], [`STATUS_ERROR`].
@@ -41,6 +46,7 @@ pub const CONTROL_SOCKET_NAME: &str = "bitwarden-ssh-agent.ctl";
 /// Request command bytes.
 const CMD_UNLOCK: u8 = 0;
 const CMD_REFRESH: u8 = 1;
+const CMD_LIST: u8 = 2;
 
 /// Reject password frames larger than this (a sane master password is tiny;
 /// this only guards against a confused or malicious local sender).
@@ -104,6 +110,7 @@ async fn handle_control_connection(
     match cmd_buf[0] {
         CMD_UNLOCK => handle_unlock(&mut stream, unlock).await,
         CMD_REFRESH => handle_refresh(&mut stream, unlock).await,
+        CMD_LIST => handle_list(&mut stream, unlock).await,
         other => {
             let msg = format!("unknown command byte {other}");
             let _ = write_response(&mut stream, STATUS_ERROR, &msg).await;
@@ -165,6 +172,30 @@ async fn handle_refresh(stream: &mut UnixStream, unlock: UnlockManager) -> Resul
         Err(e) => {
             log::warn!("control channel: refresh failed: {e:#}");
             (STATUS_ERROR, format!("refresh failed: {e:#}"))
+        }
+    };
+    write_response(stream, status, &message).await
+}
+
+/// `CMD_LIST`: report the keys currently served, unlocking on demand first if
+/// the vault is locked (same semantics as the SSH agent protocol itself).
+async fn handle_list(stream: &mut UnixStream, unlock: UnlockManager) -> Result<()> {
+    log::info!("control channel: list requested via `list` subcommand");
+    let (status, message) = match unlock.keys().await {
+        Ok(keys) if keys.is_empty() => (STATUS_OK, "The agent has no identities.".to_string()),
+        Ok(keys) => {
+            let lines: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    let s = k.summary();
+                    format!("{}  {}  {}", s.algorithm, s.fingerprint, s.comment)
+                })
+                .collect();
+            (STATUS_OK, lines.join("\n"))
+        }
+        Err(e) => {
+            log::warn!("control channel: list failed: {e:#}");
+            (STATUS_ERROR, format!("could not list keys: {e:#}"))
         }
     };
     write_response(stream, status, &message).await
@@ -279,8 +310,32 @@ pub async fn run_refresh_client(control_path: &Path) -> Result<i32> {
     read_response(&mut stream).await
 }
 
+/// Client side: connect to the control socket and ask the daemon for the keys
+/// it's currently serving — the `list` subcommand. Equivalent to `ssh-add -l`,
+/// but works without `$SSH_AUTH_SOCK` set or `ssh-add` installed, since it
+/// talks to the daemon directly. Like the SSH agent protocol, this triggers
+/// on-demand unlock if the vault is locked.
+pub async fn run_list_client(control_path: &Path) -> Result<i32> {
+    let mut stream = UnixStream::connect(control_path).await.map_err(|e| {
+        anyhow::anyhow!(
+            "could not connect to the daemon control socket at {} ({e}). \
+             Is the service running?",
+            control_path.display()
+        )
+    })?;
+
+    stream
+        .write_all(&[CMD_LIST])
+        .await
+        .context("sending list request to the daemon")?;
+    stream.flush().await.context("flushing list request")?;
+    stream.shutdown().await.context("closing write side")?;
+
+    read_response(&mut stream).await
+}
+
 /// Read a `[u8 status][UTF-8 message]` response, print it, and map it to a
-/// process exit code. Shared by the `unlock` and `refresh` clients.
+/// process exit code. Shared by the `unlock`, `refresh`, and `list` clients.
 async fn read_response(stream: &mut UnixStream) -> Result<i32> {
     let mut resp = Vec::new();
     stream
