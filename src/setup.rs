@@ -257,27 +257,20 @@ async fn provision_master_password(
     config_path: &std::path::Path,
     api_key: &ApiKeyInput,
 ) -> Result<UnlockStrategy> {
-    step(4, "Master password / unlock strategy");
+    step(4, "Master password unlock");
     println!("The master password is what actually unlocks your vault. It is");
-    println!("never stored in plaintext. Choose how the daemon should obtain it:\n");
+    println!("never stored in plaintext.\n");
+    println!("Whatever you choose here, the daemon ALWAYS falls back to prompting");
+    println!("you for the master password via systemd-ask-password whenever it");
+    println!("starts without a valid credential to unlock the vault — that is just");
+    println!("how the daemon behaves, not a separate mode you have to pick.\n");
+    println!("Optionally, you can also provision an encrypted systemd credential so");
+    println!("the vault unlocks automatically at startup with no prompt.\n");
 
-    let choice = prompt_choice(
-        "Unlock strategy?",
-        &[
-            (
-                "credential",
-                "auto-unlock at startup from an encrypted systemd credential (recommended)",
-            ),
-            (
-                "on-demand",
-                "prompt via systemd-ask-password the first time SSH uses the agent",
-            ),
-        ],
-    )?;
-
-    if choice == "on-demand" {
-        println!("\nNo credential will be provisioned; the daemon will prompt on");
-        println!("first use. You can re-run `setup` later to switch to auto-unlock.");
+    if !prompt_yes_no("Set up auto-unlock at startup? (recommended)", true)? {
+        println!("\nNo credential will be provisioned. The daemon will start locked");
+        println!("and prompt via systemd-ask-password on first use. You can re-run");
+        println!("`setup` later to switch to auto-unlock.");
         return Ok(UnlockStrategy::OnDemand);
     }
 
