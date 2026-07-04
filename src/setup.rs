@@ -10,16 +10,102 @@
 
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::process::Stdio;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use tokio::process::Command;
+
+use crate::bitwarden::BitwardenCli;
 
 /// Entry point for `bitwarden-ssh-agent setup`.
 pub async fn run(config_override: Option<PathBuf>) -> Result<()> {
     let _ = config_override;
     println!("bitwarden-ssh-agent setup");
     println!("=========================\n");
-    println!("This will walk you through configuring the agent end-to-end.\n");
+    println!("This will walk you through configuring the agent end-to-end.");
+    println!("Every step that would overwrite something asks first, so it is");
+    println!("safe to re-run.\n");
+
+    ensure_bw_cli().await?;
+
     Ok(())
+}
+
+// --- step 1: Bitwarden CLI ---------------------------------------------------
+
+/// Ensure the `bw` CLI is available, offering to install it via npm if not.
+async fn ensure_bw_cli() -> Result<()> {
+    step(1, "Bitwarden CLI (`bw`)");
+
+    // Reuse the daemon's own CLI wrapper so we honour BW_CLI_PATH etc.
+    let cli = BitwardenCli::new(None);
+    match cli.version().await {
+        Ok(v) => {
+            println!("Found Bitwarden CLI (version {v}).");
+            return Ok(());
+        }
+        Err(_) => {
+            println!("The `bw` CLI was not found on your PATH.");
+        }
+    }
+
+    // The `bw` CLI is a Node package; we need npm to install it.
+    if !program_runs("npm", &["--version"]).await {
+        anyhow::bail!(
+            "`bw` is not installed and `npm` is not available to install it.\n\
+             Install Node.js (which provides npm) from https://nodejs.org, then\n\
+             run `npm install -g @bitwarden/cli`, and re-run `setup`."
+        );
+    }
+
+    if !prompt_yes_no(
+        "Install it now with `npm install -g @bitwarden/cli`?",
+        true,
+    )? {
+        anyhow::bail!(
+            "Bitwarden CLI is required. Install it with\n\
+             `npm install -g @bitwarden/cli` and re-run `setup`."
+        );
+    }
+
+    println!("Running `npm install -g @bitwarden/cli` (this may take a moment)...");
+    let status = Command::new("npm")
+        .args(["install", "-g", "@bitwarden/cli"])
+        .status()
+        .await
+        .context("spawning `npm install -g @bitwarden/cli`")?;
+    if !status.success() {
+        anyhow::bail!(
+            "`npm install -g @bitwarden/cli` failed. Install `bw` manually and \
+             re-run `setup`."
+        );
+    }
+
+    // Confirm the freshly-installed binary is actually reachable now.
+    match cli.version().await {
+        Ok(v) => {
+            println!("Installed Bitwarden CLI (version {v}).");
+            Ok(())
+        }
+        Err(_) => anyhow::bail!(
+            "`bw` was installed but is still not on your PATH. The npm global bin \
+             directory (`npm config get prefix`/bin) may not be on PATH. Add it, \
+             or set BW_CLI_PATH, then re-run `setup`."
+        ),
+    }
+}
+
+/// Return true if `<program> <args...>` runs and exits successfully.
+async fn program_runs(program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 // --- terminal helpers -------------------------------------------------------
