@@ -295,6 +295,7 @@ pub async fn run(
     ssh_dir: Option<PathBuf>,
     config: Option<PathBuf>,
     dry_run: bool,
+    control_socket: Option<PathBuf>,
 ) -> Result<()> {
     println!("bitwarden-ssh-agent import");
     println!("==========================\n");
@@ -340,7 +341,15 @@ pub async fn run(
     );
 
     // Let the user pick which keys to import, then decide per-key what to do.
-    let result = run_wizard(&mut candidates, &vault_index, &cli, &session, dry_run).await;
+    let result = run_wizard(
+        &mut candidates,
+        &vault_index,
+        &cli,
+        &session,
+        dry_run,
+        control_socket.as_deref(),
+    )
+    .await;
 
     // Scrub the raw private-key material we read off disk regardless of outcome.
     for c in &mut candidates {
@@ -356,6 +365,7 @@ async fn run_wizard(
     cli: &BitwardenCli,
     session: &Session,
     dry_run: bool,
+    control_socket: Option<&Path>,
 ) -> Result<()> {
     // Precompute, for each candidate, whether it is already in the vault.
     let matches: Vec<Option<&VaultKeyRef>> = candidates
@@ -412,7 +422,7 @@ async fn run_wizard(
     // If we actually changed the vault and the daemon is running, offer to nudge
     // it so the new keys are served immediately without a restart.
     if !dry_run && changes > 0 {
-        if let Err(e) = offer_daemon_refresh().await {
+        if let Err(e) = offer_daemon_refresh(control_socket).await {
             // Best-effort: a failed refresh must not fail the import itself.
             println!("Could not refresh the running daemon: {e:#}");
             println!("The new keys will be picked up next time it (re)starts.");
@@ -421,53 +431,34 @@ async fn run_wizard(
     Ok(())
 }
 
-/// systemd user unit name for the running daemon (matches `setup`).
-const SERVICE_UNIT: &str = "bitwarden-ssh-agent.service";
-
-/// If the daemon service is active, offer to send it SIGHUP so it re-syncs the
-/// vault and picks up the newly-imported keys (the same refresh path the daemon
-/// installs in `main.rs`). No-op if the service isn't running.
-async fn offer_daemon_refresh() -> Result<()> {
-    use tokio::process::Command;
-
-    let is_active = Command::new("systemctl")
-        .args(["--user", "is-active", SERVICE_UNIT])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
-        .unwrap_or(false);
-    if !is_active {
-        // Daemon not running under systemd --user; nothing to signal.
+/// If the running daemon's control socket is reachable, offer to ask it to
+/// re-sync the vault and pick up the newly-imported keys right away — over the
+/// same local IPC channel the `unlock` command already uses, not a process
+/// signal. No-op (not an error) if the daemon isn't running.
+async fn offer_daemon_refresh(control_socket: Option<&Path>) -> Result<()> {
+    let control_path = match crate::control::resolve_control_path(control_socket.map(Path::to_path_buf)) {
+        Ok(p) => p,
+        Err(_) => return Ok(()), // e.g. no XDG_RUNTIME_DIR; nothing to offer.
+    };
+    if tokio::net::UnixStream::connect(&control_path).await.is_err() {
+        // Daemon not running (or not listening yet); nothing to refresh.
         return Ok(());
     }
 
     println!();
     if !prompt_yes_no(
-        "The agent daemon is running. Send it a refresh signal (SIGHUP) now so \
-         the new keys are served immediately?",
+        "The agent daemon is running. Ask it to refresh now so the new keys are \
+         served immediately?",
         true,
     )? {
         println!(
-            "Skipped. Refresh later with `systemctl --user kill -s HUP {SERVICE_UNIT}` \
+            "Skipped. Refresh later with `bitwarden-ssh-agent refresh` \
              (or just re-run your SSH command; a restart also picks them up)."
         );
         return Ok(());
     }
 
-    let out = Command::new("systemctl")
-        .args(["--user", "kill", "-s", "HUP", SERVICE_UNIT])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await
-        .context("running `systemctl --user kill -s HUP`")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "`systemctl --user kill` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    println!("Sent SIGHUP; the daemon is re-syncing and reloading its keys.");
+    crate::control::run_refresh_client(&control_path).await?;
     Ok(())
 }
 

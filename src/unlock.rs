@@ -40,6 +40,14 @@ pub enum UnlockOutcome {
     AlreadyUnlocked(usize),
 }
 
+/// Result of a manual refresh request via the control channel.
+pub enum RefreshOutcome {
+    /// The vault was already unlocked and its keys were re-synced/reloaded.
+    Refreshed(usize),
+    /// The vault is still locked; there is nothing to refresh yet.
+    StillLocked,
+}
+
 /// Why a manual unlock failed, so the caller can report a specific reason.
 pub enum UnlockError {
     /// `bw unlock` rejected the master password.
@@ -107,25 +115,27 @@ impl UnlockManager {
 
     /// Re-sync the vault and reload SSH keys using the existing session.
     ///
-    /// Triggered by SIGHUP so newly-added vault items can be picked up without
+    /// Triggered by SIGHUP, or by the `import`/`unlock` commands over the
+    /// control socket, so newly-added vault items can be picked up without
     /// restarting the daemon. Reuses the already-unlocked session, so the master
     /// password is never re-prompted. If the vault is still locked (never
     /// unlocked yet), there is nothing to refresh — the next client request will
     /// prompt as usual.
-    pub async fn refresh(&self) -> Result<()> {
+    pub async fn refresh(&self) -> Result<RefreshOutcome> {
         let mut state = self.inner.state.lock().await;
         let session = match &*state {
             State::Locked => {
                 log::info!("refresh requested but vault is locked; nothing to do yet");
-                return Ok(());
+                return Ok(RefreshOutcome::StillLocked);
             }
             State::Unlocked { session, .. } => Arc::clone(session),
         };
 
         log::info!("refreshing vault: re-syncing and reloading SSH keys");
         let keys = self.load_keys(&session).await?;
+        let count = keys.len();
         *state = State::Unlocked { session, keys };
-        Ok(())
+        Ok(RefreshOutcome::Refreshed(count))
     }
 
     /// At startup, try to unlock non-interactively using a systemd credential.

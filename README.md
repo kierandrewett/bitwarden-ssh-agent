@@ -80,8 +80,10 @@ bitwarden-ssh-agent import          # --dry-run to preview, --ssh-dir <PATH> for
    present; if passphrase-protected, choose decrypt now / store encrypted
    blob (backup only) / skip; set the item name.
 4. Creates vault items via `bw` (key piped through stdin, never argv).
-5. If the daemon is running, offers a `SIGHUP` to pick up the new keys
-   without a restart.
+5. If the daemon is running, offers to refresh it over its local control
+   socket (the same channel `unlock` uses) so the new keys are served
+   immediately — no restart, no signal. Run it any time with:
+   `bitwarden-ssh-agent refresh`.
 
 ## Manual setup
 

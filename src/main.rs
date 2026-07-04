@@ -68,6 +68,12 @@ enum Command {
     /// exactly which to import (a wizard, so you stay in control). Pass
     /// `--dry-run` to preview everything without creating any vault items.
     Import(ImportArgs),
+
+    /// Ask the running daemon to re-sync the vault and reload its SSH keys
+    /// right now, without restarting it or re-entering the master password
+    /// (it reuses the session it's already unlocked with). Useful after adding
+    /// or editing SSH Key items directly in Bitwarden.
+    Refresh(RefreshArgs),
 }
 
 #[derive(clap::Args)]
@@ -86,10 +92,23 @@ struct ImportArgs {
     /// would be created instead of actually creating any vault items.
     #[arg(long)]
     dry_run: bool,
+
+    /// Path to the daemon's control socket (used to offer a post-import
+    /// refresh). Defaults to `$XDG_RUNTIME_DIR/bitwarden-ssh-agent.ctl`.
+    #[arg(long, value_name = "PATH")]
+    control_socket: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
 struct UnlockArgs {
+    /// Path to the daemon's control socket.
+    /// Defaults to `$XDG_RUNTIME_DIR/bitwarden-ssh-agent.ctl`.
+    #[arg(long, value_name = "PATH")]
+    control_socket: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct RefreshArgs {
     /// Path to the daemon's control socket.
     /// Defaults to `$XDG_RUNTIME_DIR/bitwarden-ssh-agent.ctl`.
     #[arg(long, value_name = "PATH")]
@@ -130,8 +149,20 @@ async fn main() -> Result<()> {
         Command::Serve(args) => serve(args).await,
         Command::Setup(args) => setup::run(args.config).await,
         Command::Unlock(args) => unlock_cli(args).await,
-        Command::Import(args) => import::run(args.ssh_dir, args.config, args.dry_run).await,
+        Command::Import(args) => {
+            import::run(args.ssh_dir, args.config, args.dry_run, args.control_socket).await
+        }
+        Command::Refresh(args) => refresh_cli(args).await,
     }
+}
+
+/// `refresh` subcommand: ask the running daemon to re-sync the vault and
+/// reload its keys over the control socket, without touching the master
+/// password. Also used internally by `import` after adding new keys.
+async fn refresh_cli(args: RefreshArgs) -> Result<()> {
+    let control_path = control::resolve_control_path(args.control_socket)?;
+    let code = control::run_refresh_client(&control_path).await?;
+    std::process::exit(code);
 }
 
 /// `unlock` subcommand: prompt (masked) for the master password and hand it to
@@ -254,8 +285,14 @@ fn spawn_sighup_refresh(unlock: UnlockManager) {
         };
         while sighup.recv().await.is_some() {
             log::info!("received SIGHUP; refreshing vault keys");
-            if let Err(e) = unlock.refresh().await {
-                log::error!("SIGHUP key refresh failed: {e:#}");
+            match unlock.refresh().await {
+                Ok(crate::unlock::RefreshOutcome::Refreshed(n)) => {
+                    log::info!("refreshed: now serving {n} SSH key(s)")
+                }
+                Ok(crate::unlock::RefreshOutcome::StillLocked) => {
+                    log::info!("refresh requested but vault is still locked; nothing to do")
+                }
+                Err(e) => log::error!("SIGHUP key refresh failed: {e:#}"),
             }
         }
     });

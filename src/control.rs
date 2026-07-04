@@ -15,9 +15,12 @@
 //!
 //! ## Wire protocol (deliberately minimal — this is not the SSH agent protocol)
 //!
-//! Request (client → daemon): a single frame `[u32 BE length][password bytes]`.
-//! There is only one request type (unlock), so no command byte is needed. The
-//! length is capped at [`MAX_PASSWORD_LEN`] to reject anything absurd.
+//! Request (client → daemon): `[u8 command][body]`.
+//! - [`CMD_UNLOCK`]: body is `[u32 BE length][password bytes]`, capped at
+//!   [`MAX_PASSWORD_LEN`] to reject anything absurd.
+//! - [`CMD_REFRESH`]: no body — re-syncs the vault and reloads keys using the
+//!   session already unlocked (e.g. by `import`, after adding new vault items,
+//!   without needing `systemctl kill -HUP` or the master password again).
 //!
 //! Response (daemon → client): `[u8 status][UTF-8 message]`, read to EOF.
 //! `status` is one of [`STATUS_OK`], [`STATUS_WRONG_PASSWORD`], [`STATUS_ERROR`].
@@ -30,10 +33,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use zeroize::Zeroize;
 
-use crate::unlock::{UnlockError, UnlockManager, UnlockOutcome};
+use crate::unlock::{RefreshOutcome, UnlockError, UnlockManager, UnlockOutcome};
 
 /// Control-socket filename inside `$XDG_RUNTIME_DIR`.
 pub const CONTROL_SOCKET_NAME: &str = "bitwarden-ssh-agent.ctl";
+
+/// Request command bytes.
+const CMD_UNLOCK: u8 = 0;
+const CMD_REFRESH: u8 = 1;
 
 /// Reject password frames larger than this (a sane master password is tiny;
 /// this only guards against a confused or malicious local sender).
@@ -82,18 +89,37 @@ pub async fn serve_control(listener: UnixListener, unlock: UnlockManager) {
     }
 }
 
-/// Handle a single control connection: read the password frame, run the unlock,
-/// write back a status + message.
+/// Handle a single control connection: dispatch on the leading command byte,
+/// then write back a status + message.
 async fn handle_control_connection(
     mut stream: UnixStream,
     unlock: UnlockManager,
 ) -> Result<()> {
-    let password = match read_password_frame(&mut stream).await {
+    let mut cmd_buf = [0u8; 1];
+    if let Err(e) = stream.read_exact(&mut cmd_buf).await {
+        let _ = write_response(&mut stream, STATUS_ERROR, &format!("bad request: {e}")).await;
+        return Err(e).context("reading command byte");
+    }
+
+    match cmd_buf[0] {
+        CMD_UNLOCK => handle_unlock(&mut stream, unlock).await,
+        CMD_REFRESH => handle_refresh(&mut stream, unlock).await,
+        other => {
+            let msg = format!("unknown command byte {other}");
+            let _ = write_response(&mut stream, STATUS_ERROR, &msg).await;
+            bail!(msg)
+        }
+    }
+}
+
+/// `CMD_UNLOCK`: read the password frame, run the unlock, respond.
+async fn handle_unlock(stream: &mut UnixStream, unlock: UnlockManager) -> Result<()> {
+    let password = match read_password_frame(stream).await {
         // Wrapped in SecretString so the plaintext is zeroized on drop.
         Ok(pw) => SecretString::from(pw),
         Err(e) => {
             // Malformed request: tell the client rather than hanging.
-            let _ = write_response(&mut stream, STATUS_ERROR, &format!("bad request: {e:#}")).await;
+            let _ = write_response(stream, STATUS_ERROR, &format!("bad request: {e:#}")).await;
             return Err(e);
         }
     };
@@ -120,7 +146,28 @@ async fn handle_control_connection(
             (STATUS_ERROR, format!("unlock failed: {e:#}"))
         }
     };
-    write_response(&mut stream, status, &message).await
+    write_response(stream, status, &message).await
+}
+
+/// `CMD_REFRESH`: re-sync the vault and reload keys using the existing session
+/// (no password involved; if the vault is locked there's simply nothing to do).
+async fn handle_refresh(stream: &mut UnixStream, unlock: UnlockManager) -> Result<()> {
+    log::info!("control channel: refresh requested via `import` (or manually)");
+    let (status, message) = match unlock.refresh().await {
+        Ok(RefreshOutcome::Refreshed(n)) => (
+            STATUS_OK,
+            format!("vault refreshed; {n} SSH key(s) now served by the agent"),
+        ),
+        Ok(RefreshOutcome::StillLocked) => (
+            STATUS_OK,
+            "vault is still locked; nothing to refresh yet (run `unlock` first)".to_string(),
+        ),
+        Err(e) => {
+            log::warn!("control channel: refresh failed: {e:#}");
+            (STATUS_ERROR, format!("refresh failed: {e:#}"))
+        }
+    };
+    write_response(stream, status, &message).await
 }
 
 /// Read one `[u32 BE length][password bytes]` request frame.
@@ -184,7 +231,7 @@ pub async fn run_unlock_client(
     // Daemon is reachable: now prompt for the password.
     let password = prompt()?;
 
-    // Send the length-prefixed password, then scrub our copy.
+    // Send the command byte, then the length-prefixed password, then scrub our copy.
     let mut body = password.expose_secret().as_bytes().to_vec();
     let len = body.len();
     if len == 0 {
@@ -194,6 +241,7 @@ pub async fn run_unlock_client(
         bail!("password is implausibly long ({len} bytes); refusing to send");
     }
     let send = async {
+        stream.write_all(&[CMD_UNLOCK]).await?;
         stream.write_all(&(len as u32).to_be_bytes()).await?;
         stream.write_all(&body).await?;
         stream.flush().await?;
@@ -204,7 +252,36 @@ pub async fn run_unlock_client(
     drop(password);
     sent.context("sending password to the daemon")?;
 
-    // Read the daemon's response: [status][message...].
+    read_response(&mut stream).await
+}
+
+/// Client side: connect to the control socket and ask the already-running
+/// daemon to re-sync the vault and reload keys, without touching the master
+/// password at all. Used by `import` after adding new vault items, and
+/// available as a standalone `refresh` action. Fails fast (no-op, not an
+/// error) if the daemon isn't running — the caller decides what that means.
+pub async fn run_refresh_client(control_path: &Path) -> Result<i32> {
+    let mut stream = UnixStream::connect(control_path).await.map_err(|e| {
+        anyhow::anyhow!(
+            "could not connect to the daemon control socket at {} ({e}). \
+             Is the service running?",
+            control_path.display()
+        )
+    })?;
+
+    stream
+        .write_all(&[CMD_REFRESH])
+        .await
+        .context("sending refresh request to the daemon")?;
+    stream.flush().await.context("flushing refresh request")?;
+    stream.shutdown().await.context("closing write side")?;
+
+    read_response(&mut stream).await
+}
+
+/// Read a `[u8 status][UTF-8 message]` response, print it, and map it to a
+/// process exit code. Shared by the `unlock` and `refresh` clients.
+async fn read_response(stream: &mut UnixStream) -> Result<i32> {
     let mut resp = Vec::new();
     stream
         .read_to_end(&mut resp)
