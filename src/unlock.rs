@@ -23,6 +23,31 @@ use crate::config::ApiKey;
 /// Filename of the systemd credential holding the master password.
 const MASTER_PW_CREDENTIAL: &str = "bw_master_password";
 
+/// How long the on-demand `systemd-ask-password` prompt waits for an answer.
+///
+/// The default (~90s, or the ~45s seen in practice) makes a *headless* daemon —
+/// where usually nothing is watching the ask-password queue — hang every client
+/// request for a long time before failing. The reliable interactive path is now
+/// the `unlock` subcommand; this prompt is only a bonus for users who run their
+/// own ask-password agent, so a short window is plenty and fails fast otherwise.
+const ASK_PASSWORD_TIMEOUT_SECS: u32 = 10;
+
+/// Result of a successful manual unlock via the control channel.
+pub enum UnlockOutcome {
+    /// The vault was locked and is now unlocked; carries the SSH key count.
+    Unlocked(usize),
+    /// The vault was already unlocked; carries the currently-served key count.
+    AlreadyUnlocked(usize),
+}
+
+/// Why a manual unlock failed, so the caller can report a specific reason.
+pub enum UnlockError {
+    /// `bw unlock` rejected the master password.
+    WrongPassword(String),
+    /// Anything else (e.g. `bw` unreachable, device not logged in, load error).
+    Other(anyhow::Error),
+}
+
 enum State {
     Locked,
     Unlocked {
@@ -67,7 +92,10 @@ impl UnlockManager {
             return Ok(Arc::clone(keys));
         }
 
-        log::info!("vault locked; prompting for master password via systemd-ask-password");
+        log::info!(
+            "vault locked; trying systemd-ask-password (best-effort). If this times \
+             out, unlock the daemon directly with `bitwarden-ssh-agent unlock`"
+        );
         let password = ask_password().await?;
         let (session, keys) = self.unlock_and_load(&password).await?;
         *state = State::Unlocked {
@@ -120,14 +148,48 @@ impl UnlockManager {
         Ok(true)
     }
 
-    /// Perform the full login + unlock + load-keys flow for a given password,
-    /// returning the live session (retained for later refreshes) and the keys.
-    async fn unlock_and_load(
+    /// Manually unlock the vault with a password supplied over the control
+    /// channel (the `unlock` subcommand).
+    ///
+    /// Takes the same state mutex as [`Self::keys`], so a manual unlock racing
+    /// with an in-flight on-demand `systemd-ask-password` attempt (or another
+    /// concurrent `unlock`) is serialized by the same single-flight guarantee:
+    /// whoever gets the lock first does the work, and a caller that finds the
+    /// vault already unlocked returns immediately.
+    pub async fn unlock_with_password(
         &self,
         password: &SecretString,
-    ) -> Result<(Arc<Session>, Arc<Vec<VaultKey>>)> {
+    ) -> std::result::Result<UnlockOutcome, UnlockError> {
+        let mut state = self.inner.state.lock().await;
+        if let State::Unlocked { keys, .. } = &*state {
+            return Ok(UnlockOutcome::AlreadyUnlocked(keys.len()));
+        }
+
+        self.ensure_logged_in().await.map_err(UnlockError::Other)?;
+        // A failure here, after a successful login, is overwhelmingly a wrong
+        // master password, so surface it as such for a clear client message.
+        let session = Arc::new(
+            self.inner
+                .cli
+                .unlock(password)
+                .await
+                .map_err(|e| UnlockError::WrongPassword(format!("{e:#}")))?,
+        );
+        let keys = self
+            .load_keys(&session)
+            .await
+            .map_err(UnlockError::Other)?;
+        let count = keys.len();
+        *state = State::Unlocked { session, keys };
+        log::info!("vault unlocked via control channel; cached {count} SSH key(s)");
+        Ok(UnlockOutcome::Unlocked(count))
+    }
+
+    /// Ensure the `bw` device is logged in: via the API key if configured, else
+    /// require that a prior `bw login` already authenticated the device.
+    async fn ensure_logged_in(&self) -> Result<()> {
         match &self.inner.api_key {
-            Some(api_key) => self.inner.cli.login_with_api_key(api_key).await?,
+            Some(api_key) => self.inner.cli.login_with_api_key(api_key).await,
             None => {
                 // No API key configured: the device must already be logged in
                 // (e.g. a prior `bw login`), otherwise we cannot proceed.
@@ -138,9 +200,18 @@ impl UnlockManager {
                          set BW_CLIENTID/BW_CLIENTSECRET or run `bw login` once"
                     );
                 }
+                Ok(())
             }
         }
+    }
 
+    /// Perform the full login + unlock + load-keys flow for a given password,
+    /// returning the live session (retained for later refreshes) and the keys.
+    async fn unlock_and_load(
+        &self,
+        password: &SecretString,
+    ) -> Result<(Arc<Session>, Arc<Vec<VaultKey>>)> {
+        self.ensure_logged_in().await?;
         let session = Arc::new(self.inner.cli.unlock(password).await?);
         let keys = self.load_keys(&session).await?;
         Ok((session, keys))
@@ -218,6 +289,11 @@ async fn ask_password() -> Result<SecretString> {
     let output = Command::new("systemd-ask-password")
         .arg("--icon=dialog-password")
         .arg("--id=bitwarden-ssh-agent")
+        // Short timeout: on a headless --user service nothing is usually
+        // watching the ask-password queue, so without this the query hangs the
+        // client for the full default (~90s) before failing. Fail fast instead
+        // and let the user run `bitwarden-ssh-agent unlock`.
+        .arg(format!("--timeout={ASK_PASSWORD_TIMEOUT_SECS}"))
         .arg("Bitwarden master password (to unlock SSH agent):")
         .stdin(Stdio::null())
         .output()
@@ -227,7 +303,8 @@ async fn ask_password() -> Result<SecretString> {
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!(
-            "systemd-ask-password failed: {}",
+            "systemd-ask-password failed ({}); no ask-password agent answered. \
+             Unlock the daemon directly with `bitwarden-ssh-agent unlock`",
             err.trim()
         ));
     }
